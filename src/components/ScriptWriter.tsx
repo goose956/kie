@@ -376,6 +376,7 @@ export default function ScriptWriter({ onUseImagePrompt, onProduceScript, projec
   const [charAspectRatio, setCharAspectRatio] = useState("1:1");
   const [charResolution, setCharResolution] = useState<"1K" | "2K" | "4K">("1K");
   const [charGenerating, setCharGenerating] = useState(false);
+  const [charSuggesting, setCharSuggesting] = useState(false);
   const [charError, setCharError] = useState("");
   const [charPreview, setCharPreview] = useState<string | null>(null); // relative filename
   const [charPreviewUrl, setCharPreviewUrl] = useState<string | null>(null); // CDN URL for re-editing
@@ -401,6 +402,21 @@ export default function ScriptWriter({ onUseImagePrompt, onProduceScript, projec
     await fetch("/api/projects", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }) });
     onProjectsChange();
     if (activeProjectId === id) onProjectSelect(null);
+  }
+
+  async function suggestCharPrompt() {
+    setCharSuggesting(true); setCharError("");
+    try {
+      const ctx = `Ad concept: ${concept || brand || "a product ad"}. Brand: ${brand}. Tone: ${tone}. Write the recurring on-camera character/presenter for this ad.`;
+      const res = await fetch("/api/ad/suggest-prompt", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: "character", context: ctx }),
+      });
+      const d = await res.json();
+      if (d.error) { setCharError(d.error); return; }
+      if (d.prompt) setCharPrompt(d.prompt);
+    } catch (e) { setCharError(String(e)); }
+    finally { setCharSuggesting(false); }
   }
 
   async function generateCharacter(editImageUrl?: string) {
@@ -735,7 +751,14 @@ export default function ScriptWriter({ onUseImagePrompt, onProduceScript, projec
               {!existingChar && (
                 <div className="space-y-3">
                   <div>
-                    <p className="text-[10px] uppercase tracking-widest text-gray-500 mb-1">Describe your character</p>
+                    <div className="flex items-center justify-between mb-1">
+                      <p className="text-[10px] uppercase tracking-widest text-gray-500">Describe your character</p>
+                      <button onClick={suggestCharPrompt} disabled={charSuggesting}
+                        title="Draft a character from your concept/brand"
+                        className="text-[10px] border border-gray-300 text-gray-600 rounded px-2 py-0.5 hover:bg-gray-50 disabled:opacity-40 transition-colors">
+                        {charSuggesting ? "…" : "✨ Suggest"}
+                      </button>
+                    </div>
                     <p className="text-[10px] text-gray-500 mb-2">Be specific — age, build, clothing, distinguishing features. This image anchors every shot.</p>
                     <textarea value={charPrompt} onChange={e => setCharPrompt(e.target.value)}
                       placeholder="e.g. Athletic white male, early 30s, dark stubble, wearing a grey technical jacket and red running shoes, full body, neutral pose, clean studio background"

@@ -49,6 +49,8 @@ db.exec(`
     hero_ref_filename      TEXT,
     hero_ref_url           TEXT,
     style                  TEXT,
+    platform               TEXT,
+    aspect_ratio           TEXT NOT NULL DEFAULT '16:9',
     final_video_filename   TEXT,
     error                  TEXT,
     created_at             TEXT NOT NULL DEFAULT (datetime('now'))
@@ -111,8 +113,14 @@ try { db.exec("ALTER TABLE production_shots ADD COLUMN bg_asset_id INTEGER"); } 
 try { db.exec("ALTER TABLE productions ADD COLUMN style TEXT"); } catch {}
 // Uploaded product photo's kie CDN url (fetchable) — so a real client's product can be a reference.
 try { db.exec("ALTER TABLE productions ADD COLUMN product_image_url TEXT"); } catch {}
+// Target platform + aspect ratio (drives keyframe + Veo aspect through the whole pipeline).
+try { db.exec("ALTER TABLE productions ADD COLUMN platform TEXT"); } catch {}
+try { db.exec("ALTER TABLE productions ADD COLUMN aspect_ratio TEXT NOT NULL DEFAULT '16:9'"); } catch {}
 // Style reference image: a kie-uploaded image that sets the visual tone (passed to every keyframe).
 try { db.exec("ALTER TABLE productions ADD COLUMN style_ref_url TEXT"); } catch {}
+// Content style ("polished" | "ugc") persisted from Ad Pack generation — read later (e.g. by the
+// character-reference generator) to decide a turnaround sheet (polished) vs single pose (UGC).
+try { db.exec("ALTER TABLE productions ADD COLUMN content_style TEXT"); } catch {}
 // scene_id: short grouping key from the breakdown (e.g. "kitchen") — used to auto-anchor continuity.
 try { db.exec("ALTER TABLE production_shots ADD COLUMN scene_id TEXT"); } catch {}
 // last_frame_url / last_frame_filename: final frame of the shot's clip, uploaded to kie for chaining.
@@ -120,6 +128,16 @@ try { db.exec("ALTER TABLE production_shots ADD COLUMN last_frame_url TEXT"); } 
 try { db.exec("ALTER TABLE production_shots ADD COLUMN last_frame_filename TEXT"); } catch {}
 // audit_notes: consistency issue + suggested fix emitted by the cross-shot visual audit.
 try { db.exec("ALTER TABLE production_shots ADD COLUMN audit_notes TEXT"); } catch {}
+// Running total of kie credits actually spent generating this production (snapshot of
+// account balance before/after each real generation call — see trackCredits in produce.ts).
+try { db.exec("ALTER TABLE productions ADD COLUMN credits_spent REAL NOT NULL DEFAULT 0"); } catch {}
+// Hides a production from the Costs page's per-production list once reviewed — the credits it
+// spent still count toward the grand total / by-project rollups, only the itemised row is hidden.
+try { db.exec("ALTER TABLE productions ADD COLUMN cost_cleared INTEGER NOT NULL DEFAULT 0"); } catch {}
+// A template is a production whose shot STRUCTURE (camera direction, pacing, prompts) is meant
+// to be reused across different products — see server/templates.ts. Templates are always
+// project_id=null and never appear in the normal Produce list.
+try { db.exec("ALTER TABLE productions ADD COLUMN is_template INTEGER NOT NULL DEFAULT 0"); } catch {}
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -212,7 +230,7 @@ export function deleteConversation(id: number): void {
 
 export function getMessages(conversationId: number): Message[] {
   return db
-    .prepare("SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC")
+    .prepare("SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC, id ASC")
     .all(conversationId) as unknown as Message[];
 }
 
@@ -267,6 +285,12 @@ export interface Production {
   hero_ref_url: string | null;
   style: string | null;
   style_ref_url: string | null;
+  platform: string | null;
+  aspect_ratio: string; // "16:9" | "9:16"
+  content_style: string | null; // "polished" | "ugc"
+  credits_spent: number; // running total of kie credits spent generating this production
+  cost_cleared: number; // 0 | 1 — hidden from the Costs page's per-production list (totals unaffected)
+  is_template: number; // 0 | 1 — a reusable shot structure rather than a real production
   final_video_filename: string | null;
   error: string | null;
   created_at: string;
@@ -309,13 +333,18 @@ export interface NewProductionShot {
   duration_hint?: string | null;
   label_visible?: boolean;
   scene_id?: string | null;
+  use_character?: boolean;
 }
 
 export function listProductions(projectId?: number | null): Production[] {
   if (projectId != null) {
-    return db.prepare("SELECT * FROM productions WHERE project_id = ? ORDER BY created_at DESC").all(projectId) as unknown as Production[];
+    return db.prepare("SELECT * FROM productions WHERE project_id = ? AND is_template = 0 ORDER BY created_at DESC").all(projectId) as unknown as Production[];
   }
-  return db.prepare("SELECT * FROM productions ORDER BY created_at DESC").all() as unknown as Production[];
+  return db.prepare("SELECT * FROM productions WHERE is_template = 0 ORDER BY created_at DESC").all() as unknown as Production[];
+}
+
+export function listTemplates(): Production[] {
+  return db.prepare("SELECT * FROM productions WHERE is_template = 1 ORDER BY created_at DESC").all() as unknown as Production[];
 }
 
 export function getProduction(id: number): Production | null {
@@ -335,12 +364,19 @@ export function createProduction(
 
 export function updateProduction(
   id: number,
-  fields: Partial<Pick<Production, "title" | "status" | "music_filename" | "product_image_filename" | "product_image_url" | "hero_ref_filename" | "hero_ref_url" | "style" | "style_ref_url" | "final_video_filename" | "error">>,
+  fields: Partial<Pick<Production, "title" | "status" | "music_filename" | "product_image_filename" | "product_image_url" | "hero_ref_filename" | "hero_ref_url" | "style" | "style_ref_url" | "platform" | "aspect_ratio" | "content_style" | "cost_cleared" | "is_template" | "final_video_filename" | "error">>,
 ): void {
   const keys = Object.keys(fields);
   if (keys.length === 0) return;
   const sets = keys.map(k => `${k} = ?`).join(", ");
   db.prepare(`UPDATE productions SET ${sets} WHERE id = ?`).run(...Object.values(fields), id);
+}
+
+// Atomic increment (not read-modify-write in JS) so concurrent shots/productions can't clobber
+// each other's credit tracking.
+export function addProductionCredits(id: number, delta: number): void {
+  if (!delta) return;
+  db.prepare("UPDATE productions SET credits_spent = credits_spent + ? WHERE id = ?").run(delta, id);
 }
 
 export function deleteProduction(id: number): void {
@@ -351,8 +387,8 @@ export function createProductionShot(productionId: number, shot: NewProductionSh
   const { lastInsertRowid } = db
     .prepare(
       `INSERT INTO production_shots
-         (production_id, shot_number, description, image_prompt, video_prompt, camera_shot, duration_hint, label_visible, scene_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         (production_id, shot_number, description, image_prompt, video_prompt, camera_shot, duration_hint, label_visible, scene_id, use_character)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       productionId,
@@ -364,6 +400,7 @@ export function createProductionShot(productionId: number, shot: NewProductionSh
       shot.duration_hint ?? null,
       shot.label_visible === false ? 0 : 1,
       shot.scene_id ?? null,
+      shot.use_character === false ? 0 : 1,
     );
   return getProductionShot(Number(lastInsertRowid))!;
 }
@@ -421,11 +458,15 @@ export function updateProductionShot(
   id: number,
   fields: Partial<Pick<ProductionShot,
     "status" | "keyframe_filename" | "keyframe_task_id" | "keyframe_url" | "video_filename" | "video_task_id" |
-    "error" | "take_count" | "image_prompt" | "video_prompt" | "label_visible" | "duration_hint" | "is_still" | "ref_shot" | "use_character" | "bg_asset_id" |
-    "scene_id" | "last_frame_url" | "last_frame_filename" | "audit_notes">>,
+    "error" | "take_count" | "description" | "image_prompt" | "video_prompt" | "label_visible" | "duration_hint" | "is_still" | "ref_shot" | "use_character" | "bg_asset_id" |
+    "scene_id" | "last_frame_url" | "last_frame_filename" | "audit_notes" | "shot_number">>,
 ): void {
   const keys = Object.keys(fields);
   if (keys.length === 0) return;
   const sets = keys.map(k => `${k} = ?`).join(", ");
   db.prepare(`UPDATE production_shots SET ${sets} WHERE id = ?`).run(...Object.values(fields), id);
+}
+
+export function deleteProductionShot(id: number): void {
+  db.prepare("DELETE FROM production_shots WHERE id = ?").run(id);
 }

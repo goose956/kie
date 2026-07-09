@@ -4,6 +4,9 @@ import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import DirectorPanel from "./DirectorPanel";
 import ScriptWriter from "./ScriptWriter";
 import ProducePanel from "./ProducePanel";
+import AdPackPanel from "./AdPackPanel";
+import CostsPanel from "./CostsPanel";
+import TemplatesPanel from "./TemplatesPanel";
 import Settings from "./Settings";
 
 interface BreakdownShot {
@@ -375,8 +378,10 @@ export default function Chat() {
   const [showNewProject, setShowNewProject] = useState(false);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<number | null>(null);
-  const [view, setView] = useState<"chat" | "library" | "script" | "produce" | "settings">("chat");
+  const [view, setView] = useState<"chat" | "library" | "script" | "produce" | "adpack" | "costs" | "templates" | "settings">("adpack");
   const [activeProductionId, setActiveProductionId] = useState<number | null>(null);
+  const [confirmDeleteProject, setConfirmDeleteProject] = useState<number | null>(null);
+  const [projectError, setProjectError] = useState("");
   const [messages, setMessages] = useState<Message[]>([]);
   const [prompt, setPrompt] = useState("");
   const [mode, setMode] = useState<Mode>("image");
@@ -400,12 +405,20 @@ export default function Chat() {
   }
 
   async function createProject() {
-    if (!newProjectName.trim()) return;
+    const name = newProjectName.trim();
+    if (!name) return;
+    setProjectError("");
+    // Instant client-side guard against duplicate names (case-insensitive).
+    if (projects.some(p => p.name.toLowerCase() === name.toLowerCase())) {
+      setProjectError("A project called that already exists");
+      return;
+    }
     const res = await fetch("/api/projects", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: newProjectName.trim() }),
+      body: JSON.stringify({ name }),
     });
-    const p: Project = await res.json();
+    const p = await res.json();
+    if (!res.ok || p.error) { setProjectError(p.error || "Could not create project"); return; }
     setProjects(prev => [p, ...prev]);
     setActiveProjectId(p.id);
     setNewProjectName(""); setShowNewProject(false);
@@ -625,19 +638,18 @@ export default function Chat() {
                 className="text-[10px] text-gray-500 hover:text-gray-500 transition-colors">+ New</button>
             </div>
             {showNewProject && (
-              <div className="flex gap-1">
-                <input value={newProjectName} onChange={e => setNewProjectName(e.target.value)}
-                  onKeyDown={e => { if (e.key === "Enter") createProject(); if (e.key === "Escape") setShowNewProject(false); }}
-                  placeholder="Project name…" autoFocus
-                  className="flex-1 bg-white border border-gray-300 rounded-md px-2 py-1 text-xs text-black placeholder-gray-400 focus:outline-none min-w-0" />
-                <button onClick={createProject} className="px-2 py-1 bg-gray-900 text-white text-xs rounded-md hover:bg-gray-700 flex-shrink-0">✓</button>
+              <div className="space-y-1">
+                <div className="flex gap-1">
+                  <input value={newProjectName} onChange={e => { setNewProjectName(e.target.value); setProjectError(""); }}
+                    onKeyDown={e => { if (e.key === "Enter") createProject(); if (e.key === "Escape") setShowNewProject(false); }}
+                    placeholder="Project name…" autoFocus
+                    className="flex-1 bg-white border border-gray-300 rounded-md px-2 py-1 text-xs text-black placeholder-gray-400 focus:outline-none min-w-0" />
+                  <button onClick={createProject} className="px-2 py-1 bg-gray-900 text-white text-xs rounded-md hover:bg-gray-700 flex-shrink-0">✓</button>
+                </div>
+                {projectError && <p className="text-red-500 text-[10px]">{projectError}</p>}
               </div>
             )}
             <div className="space-y-0.5 max-h-28 overflow-y-auto">
-              <button onClick={() => { setActiveProjectId(null); setActiveId(null); setMessages([]); loadConversations(null); }}
-                className={`w-full text-left px-2 py-1.5 rounded-md text-xs transition-colors ${activeProjectId === null ? "bg-gray-100 text-gray-900" : "text-gray-500 hover:bg-gray-50 hover:text-gray-500"}`}>
-                All conversations
-              </button>
               {projects.map(p => (
                 <div key={p.id} className="group flex items-center gap-1">
                   {p.character_image
@@ -655,65 +667,107 @@ export default function Chat() {
             </div>
           </div>
 
-          <div className="flex rounded-lg border border-gray-200 overflow-hidden mb-3">
-            {([["script", "Script"], ["produce", "Produce"], ["chat", "Chats"], ["library", "Library"], ["settings", "Settings"]] as const).map(([v, label]) => (
+          {/* Vertical nav — the production flow, top to bottom */}
+          <div className="flex flex-col gap-1">
+            {([["adpack", "Ad Pack"], ["produce", "Produce"], ["library", "Library"], ["templates", "Templates"], ["costs", "Costs"], ["settings", "Settings"]] as const).map(([v, label]) => (
               <button key={v} onClick={() => setView(v)}
-                className={`flex-1 py-1.5 text-xs font-medium transition-colors ${view === v ? "bg-gray-900 text-white" : "text-gray-500 hover:text-gray-900"}`}>
+                className={`w-full text-left px-3 py-2 rounded-lg text-xs font-medium transition-colors ${view === v ? "bg-gray-900 text-white" : "text-gray-500 hover:bg-gray-100 hover:text-gray-900"}`}>
                 {label}
               </button>
             ))}
           </div>
-          {view === "chat" && (
-            <button onClick={newConversation}
-              className="w-full bg-gray-100 text-gray-500 text-xs font-medium rounded-lg py-2 hover:bg-gray-700 transition-colors border border-gray-200">
-              + New conversation
-            </button>
-          )}
-          {view === "script" && (
-            <button onClick={() => { setView("chat"); newConversation(); }}
-              className="w-full bg-gray-100 text-gray-500 text-xs font-medium rounded-lg py-2 hover:bg-gray-700 transition-colors border border-gray-200">
-              + New chat
-            </button>
-          )}
         </div>
-        {(view === "chat" || view === "script") && (
-          <div className="flex-1 overflow-y-auto p-2">
-            {conversations.length === 0 && (
-              <p className="text-xs text-gray-500 px-2 py-4 text-center">No conversations yet</p>
-            )}
-            {conversations.map(c => (
-              <div key={c.id} onClick={() => setActiveId(c.id)}
-                className={`group flex items-center justify-between rounded-lg px-3 py-2 cursor-pointer mb-0.5 transition-colors ${
-                  activeId === c.id ? "bg-gray-100 text-gray-900" : "text-gray-500 hover:bg-gray-50 hover:text-gray-500"
-                }`}>
-                <span className="text-xs truncate flex-1">{c.title}</span>
-                <button onClick={e => { e.stopPropagation(); deleteConversation(c.id); }}
-                  className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-red-400 ml-2 transition-all text-xs">✕</button>
-              </div>
-            ))}
-          </div>
-        )}
       </aside>
 
       {/* Main */}
       <main className="flex-1 flex flex-col overflow-hidden bg-white">
+        {/* Flow step bar */}
+        {view !== "settings" && view !== "costs" && view !== "templates" && activeProjectId != null && (
+          <div className="px-4 py-2 border-b border-gray-200 flex items-center gap-2 text-[10px] flex-shrink-0">
+            <span className="text-green-600 font-medium">① Project ✓</span>
+            <span className="text-gray-300">›</span>
+            <button onClick={() => setView("adpack")}
+              className={`${view === "adpack" ? "text-gray-900 font-medium" : "text-gray-400 hover:text-gray-700"}`}>
+              ② Create ads
+            </button>
+            <span className="text-gray-300">›</span>
+            <button onClick={() => setView("produce")}
+              className={`${view === "produce" ? "text-gray-900 font-medium" : "text-gray-400 hover:text-gray-700"}`}>
+              ③ Produce
+            </button>
+            <span className="ml-auto text-gray-400">{projects.find(p => p.id === activeProjectId)?.name}</span>
+          </div>
+        )}
         {view === "settings" ? (
           <Settings />
+        ) : view === "costs" ? (
+          <CostsPanel projects={projects} />
+        ) : view === "templates" ? (
+          <TemplatesPanel projects={projects} onProjectsChange={loadProjects} onGoToProduce={(id, projectId) => { setActiveProjectId(projectId); setActiveProductionId(id); setView("produce"); }} />
+        ) : activeProjectId == null ? (
+          /* Project-first gate — nothing else unlocks until a project is chosen */
+          <div className="flex-1 overflow-y-auto flex items-center justify-center p-6">
+            <div className="w-full max-w-sm space-y-4">
+              <div className="text-center space-y-1">
+                <div className="text-3xl">◆</div>
+                <p className="text-sm font-medium text-gray-900">Pick or create a project to start</p>
+                <p className="text-xs text-gray-500">Everything — characters, ad packs, productions — lives inside a project.</p>
+              </div>
+              {projects.length > 0 && (
+                <div className="space-y-1.5">
+                  <p className="text-[10px] uppercase tracking-widest text-gray-500">Your projects</p>
+                  {projects.map(p => (
+                    <div key={p.id} className="group flex items-center gap-2 border border-gray-200 rounded-lg px-3 py-2 hover:bg-gray-50 transition-colors">
+                      {p.character_image
+                        ? <img src={`/api/media/${p.character_image}`} alt="" className="w-6 h-6 rounded-full object-cover border border-gray-300 flex-shrink-0" />
+                        : <div className="w-6 h-6 rounded-full bg-gray-100 border border-gray-200 flex-shrink-0" />}
+                      <button onClick={() => { setActiveProjectId(p.id); loadConversations(p.id); }}
+                        className="text-sm text-gray-800 flex-1 truncate text-left">{p.name}</button>
+                      {confirmDeleteProject === p.id ? (
+                        <span className="flex items-center gap-1 flex-shrink-0">
+                          <button onClick={() => { deleteProject(p.id); setConfirmDeleteProject(null); }}
+                            className="text-[10px] text-red-500 hover:text-red-600 font-medium">Delete</button>
+                          <button onClick={() => setConfirmDeleteProject(null)}
+                            className="text-[10px] text-gray-400 hover:text-gray-600">Cancel</button>
+                        </span>
+                      ) : (
+                        <button onClick={() => setConfirmDeleteProject(p.id)}
+                          className="text-gray-300 hover:text-red-400 text-xs flex-shrink-0 transition-colors" title="Delete project">✕</button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="space-y-1.5">
+                <p className="text-[10px] uppercase tracking-widest text-gray-500">New project</p>
+                <div className="flex gap-2">
+                  <input value={newProjectName} onChange={e => { setNewProjectName(e.target.value); setProjectError(""); }}
+                    onKeyDown={e => { if (e.key === "Enter") createProject(); }}
+                    placeholder="Project name…"
+                    className="flex-1 bg-white border border-gray-300 rounded-lg px-3 py-2 text-sm text-black placeholder-gray-400 focus:outline-none focus:border-gray-500" />
+                  <button onClick={createProject} disabled={!newProjectName.trim()}
+                    className="px-4 bg-gray-900 text-white text-xs font-semibold rounded-lg hover:bg-gray-700 disabled:opacity-40 transition-colors">
+                    Create
+                  </button>
+                </div>
+                {projectError && <p className="text-red-500 text-[11px]">{projectError}</p>}
+              </div>
+            </div>
+          </div>
         ) : view === "script" ? (
           <ScriptWriter
-            onUseImagePrompt={(p, camera, lighting) => {
-              setPrompt(p);
-              if (camera) setCameraShot(camera as CameraShot);
-              if (lighting) setVideoLighting(lighting as VideoLighting);
-              setMode("image");
-              setView("chat");
-              if (!activeId) newConversation();
-            }}
+            onUseImagePrompt={() => {}}
             onProduceScript={handleProduceScript}
             projects={projects}
             activeProjectId={activeProjectId}
             onProjectSelect={id => { setActiveProjectId(id); setActiveId(null); setMessages([]); loadConversations(id); }}
             onProjectsChange={loadProjects}
+          />
+        ) : view === "adpack" ? (
+          <AdPackPanel
+            projectId={activeProjectId}
+            onCreated={() => {}}
+            onGoToProduce={(id) => { setActiveProductionId(id); setView("produce"); }}
           />
         ) : view === "produce" ? (
           <ProducePanel

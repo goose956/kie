@@ -42,13 +42,34 @@ const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 const PRODUCT_KEYFRAME_BLOCK =
   "The product must appear exactly as in the reference image — label text, colours, and " +
   "proportions unchanged. The label is large, sharp, and facing the camera unless the shot " +
-  "description says otherwise.";
+  "description says otherwise. If exact text cannot be perfectly reproduced, prioritise the " +
+  "bold brand name, primary colour, and overall silhouette over any fine print or small detail " +
+  "— those matter far less than the product being instantly recognisable.";
 const PRODUCT_VIDEO_BLOCK =
   "Moderate camera motion only — no full orbit. The product stays fully in frame throughout.";
 // Used when reference images are supplied but it isn't a full product-ad shot.
 const CONSISTENCY_BLOCK =
   "Reproduce the subject(s) shown in the reference image(s) exactly — same product and/or person, " +
   "same colours, proportions, and defining details. Only the scene, framing, and action change between shots.";
+
+// Turns real product photo(s) into a clean, campaign-ready hero still — the "improve a real
+// product for production" path (as opposed to generating a hero purely from a text prompt).
+// Multiple angles (front/side/label close-up) give Nano Banana real 3D + label information
+// instead of guessing, the same principle as the character turnaround sheet used elsewhere.
+function heroFromPhotosPrompt(notes?: string): string {
+  return (
+    "Using the attached reference photo(s) — all showing the exact same real physical product, " +
+    "possibly from different angles — produce ONE clean, production-ready hero product shot for " +
+    "an ad campaign.\n" +
+    "- Preserve the product's exact shape, proportions, colours, materials, and every label/logo/" +
+    "text detail precisely as shown across the references — do not invent, alter, or simplify any branding\n" +
+    "- Replace the background with a clean, neutral studio backdrop (soft gradient or seamless surface)\n" +
+    "- Studio-quality lighting: soft, even, flattering — no harsh shadows or glare\n" +
+    "- Centred, well-composed, sharp focus, product fully in frame\n" +
+    "- No people, no hands, no props — the product alone" +
+    (notes?.trim() ? `\n\nAdditional direction: ${notes.trim()}` : "")
+  );
+}
 
 function mediaUrlAbsolute(filename: string): string {
   return `http://localhost:${PORT}/api/media/${filename}`;
@@ -58,11 +79,22 @@ function mediaUrlAbsolute(filename: string): string {
 // kie CDN files expire after ~3 days. Before each generation we HEAD-check every
 // reference URL and re-upload from the local copy if the CDN has deleted it.
 
-async function freshenUrl(url: string, localFilename: string | null): Promise<string> {
+// Some CDNs don't support HEAD — confirm liveness with a tiny ranged GET before deciding a
+// URL is gone, otherwise we'd needlessly re-upload every reference on every run.
+async function isUrlAlive(url: string): Promise<boolean> {
   try {
     const r = await fetch(url, { method: "HEAD", signal: AbortSignal.timeout(8_000) });
-    if (r.ok) return url;
-  } catch { /* network error — treat as expired */ }
+    if (r.ok) return true;
+  } catch { /* fall through to ranged GET */ }
+  try {
+    const r = await fetch(url, { headers: { Range: "bytes=0-0" }, signal: AbortSignal.timeout(8_000) });
+    if (r.ok || r.status === 206) return true;
+  } catch { /* treat as expired */ }
+  return false;
+}
+
+async function freshenUrl(url: string, localFilename: string | null): Promise<string> {
+  if (await isUrlAlive(url)) return url;
 
   if (!localFilename) throw new Error("Reference URL expired with no local backup");
   const absPath = storage.resolveMediaPath(localFilename);
@@ -132,9 +164,13 @@ async function keyframeReferenceUrls(production: db.Production, shot: db.Product
     }
   }
 
-  // Scene continuity: Fix 3 (last frame of prev shot) or Fix 2 / manual ref_shot (scene anchor)
+  // Scene continuity: Fix 3 (last frame of prev shot) or Fix 2 / manual ref_shot (scene anchor).
+  // ref_shot === 0 is an explicit "no continuity" override (distinct from null = let the
+  // pipeline auto-decide) — it skips BOTH the automatic last-frame chaining below and the
+  // scene-anchor fallback, so a shot can be deliberately unrelated to earlier ones even when
+  // it shares a scene_id.
   const allShots = db.getProductionShots(production.id);
-  if (shot.scene_id) {
+  if (shot.ref_shot !== 0 && shot.scene_id) {
     // Prefer the immediately preceding shot's last frame — true temporal continuity
     const prevWithFrame = [...allShots]
       .filter(s => s.scene_id === shot.scene_id && s.shot_number < shot.shot_number && s.last_frame_url)
@@ -170,10 +206,8 @@ async function keyframeReferenceUrls(production: db.Production, shot: db.Product
 
   // Style reference image (Fix 7) — sets visual tone, no local backup needed
   if (production.style_ref_url) {
-    try {
-      const r = await fetch(production.style_ref_url, { method: "HEAD", signal: AbortSignal.timeout(8_000) });
-      if (r.ok) refs.push(production.style_ref_url);
-    } catch { console.warn("[produce] style_ref_url unreachable — skipping"); }
+    if (await isUrlAlive(production.style_ref_url)) refs.push(production.style_ref_url);
+    else console.warn("[produce] style_ref_url unreachable — skipping");
   }
 
   return refs;
@@ -255,6 +289,58 @@ async function composeVideoPrompt(
   return base;
 }
 
+// ── Transient-error auto-retry ────────────────────────────────────────────────
+// kie occasionally returns a generic "Internal Error, Please try again later" — a
+// server-side hiccup, not a real problem with the prompt/references. Retrying the
+// whole create+poll cycle a couple of times with backoff rides through it instead
+// of failing the shot on the first blip.
+
+const TRANSIENT_PATTERNS = [/internal error/i, /try again later/i, /timed out/i, /timeout/i, /rate limit/i, /503/, /502/, /504/];
+const RETRY_DELAYS_MS = [5000, 15000, 30000]; // 3 retries: 5s, 15s, 30s backoff
+
+export function isTransientError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return TRANSIENT_PATTERNS.some(p => p.test(msg));
+}
+
+export async function withTransientRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientError(err) || attempt === RETRY_DELAYS_MS.length) throw err;
+      const delay = RETRY_DELAYS_MS[attempt];
+      console.warn(`[produce] ${label} hit a transient error, retrying in ${delay / 1000}s (attempt ${attempt + 1}/${RETRY_DELAYS_MS.length}):`, err instanceof Error ? err.message : err);
+      await sleep(delay);
+    }
+  }
+  throw lastErr;
+}
+
+// ── Cost tracking ─────────────────────────────────────────────────────────────
+// Snapshots the account's kie credit balance before/after a real generation call and adds the
+// delta to the production's running total. Two productions generating concurrently can both
+// spend between one snapshot pair, so this is an approximation, not an exact ledger — but for
+// a single-user local app it's a good enough real cost-per-ad figure. Never lets a tracking
+// failure (or the extra balance calls themselves) block or fail the actual generation.
+export async function trackCredits<T>(productionId: number, fn: () => Promise<T>): Promise<T> {
+  let before: number | null = null;
+  try { before = await kie.getCredits(); } catch { /* tracking is best-effort */ }
+
+  const result = await fn();
+
+  if (before != null) {
+    try {
+      const after = await kie.getCredits();
+      const delta = before - after;
+      if (delta > 0) db.addProductionCredits(productionId, delta);
+    } catch { /* tracking is best-effort */ }
+  }
+  return result;
+}
+
 // ── kie polling helpers ───────────────────────────────────────────────────────
 
 async function pollImageToUrl(taskId: string): Promise<string> {
@@ -277,25 +363,42 @@ async function pollVideoToUrl(taskId: string): Promise<string> {
   throw new Error("Clip generation timed out");
 }
 
+// Kling/Seedance share the generic jobs/recordInfo poll shape — see kie.pollMarketTask.
+async function pollMarketVideoToUrl(taskId: string): Promise<string> {
+  for (let i = 0; i < 120; i++) {
+    const r = await kie.pollMarketTask(taskId);
+    if (r.status === "success" && r.videoUrl) return r.videoUrl;
+    if (r.status === "failed") throw new Error(r.errorMessage || "Clip generation failed");
+    await sleep(4500);
+  }
+  throw new Error("Clip generation timed out");
+}
+
 // ── Dry-run placeholders (no kie.ai credits spent) ────────────────────────────
 // Synthesises real, playable media with ffmpeg so the loop + UI + assembly can be
 // exercised end-to-end without firing paid generations.
 
 const DRY_COLOURS = ["red", "green", "blue", "orange", "purple", "teal", "maroon", "navy", "olive", "gray"];
 
-async function synthPlaceholderImage(shot: db.ProductionShot, projectId: number | null): Promise<string> {
+// Pixel dimensions for an aspect ratio (used by dry-run placeholders so they match real output).
+function aspectDims(aspect: string): { w: number; h: number } {
+  return aspect === "9:16" ? { w: 720, h: 1280 } : { w: 1280, h: 720 };
+}
+
+async function synthPlaceholderImage(shot: db.ProductionShot, projectId: number | null, aspect: string): Promise<string> {
   const colour = DRY_COLOURS[(shot.shot_number - 1) % DRY_COLOURS.length];
+  const { w, h } = aspectDims(aspect);
   const name = `keyframe_dry_${shot.id}_${Date.now()}.png`;
   const { absPath, relPath } = storage.reserveMediaPath(name, "images", projectId);
   await runFfmpeg([
     "-y", "-f", "lavfi",
-    "-i", `color=c=${colour}:s=1280x720:d=1`,
+    "-i", `color=c=${colour}:s=${w}x${h}:d=1`,
     "-frames:v", "1", absPath,
   ]);
   return relPath;
 }
 
-async function synthPlaceholderVideo(shot: db.ProductionShot, projectId: number | null): Promise<string> {
+async function synthPlaceholderVideo(shot: db.ProductionShot, projectId: number | null, aspect: string): Promise<string> {
   // Test seam: KIE_STUDIO_FAIL_SHOTS="4,7" forces those shot numbers to fail during a
   // dry run, so the failure-resilience path can be exercised without spending credits.
   const failList = (process.env.KIE_STUDIO_FAIL_SHOTS || "").split(",").map(s => s.trim()).filter(Boolean);
@@ -304,11 +407,12 @@ async function synthPlaceholderVideo(shot: db.ProductionShot, projectId: number 
   }
 
   const colour = DRY_COLOURS[(shot.shot_number - 1) % DRY_COLOURS.length];
+  const { w, h } = aspectDims(aspect);
   const name = `clip_dry_${shot.id}_${Date.now()}.mp4`;
   const { absPath, relPath } = storage.reserveMediaPath(name, "videos", projectId);
   await runFfmpeg([
     "-y",
-    "-f", "lavfi", "-i", `color=c=${colour}:s=1280x720:d=2:r=24`,
+    "-f", "lavfi", "-i", `color=c=${colour}:s=${w}x${h}:d=2:r=24`,
     "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
     "-shortest", "-pix_fmt", "yuv420p",
     "-c:v", "libx264", "-c:a", "aac", absPath,
@@ -368,7 +472,8 @@ type Stage = "keyframes" | "videos" | "all";
 
 interface ShotOptions {
   dryRun: boolean;
-  quality: kie.VideoQuality;
+  quality: kie.VideoQuality; // Veo sub-tier (lite/fast/quality) — only used when videoEngine is "veo"
+  videoEngine?: kie.MarketVideoEngine | "veo"; // which model actually renders the clip; default "veo"
   imageModel: kie.ImageModel; // keyframe model — nano-banana-2 holds a reference far better than v1
   stage?: Stage; // keyframes-first workflow: review stills before spending on video
   keyframeOnly?: boolean;
@@ -385,6 +490,7 @@ async function processShot(
   const projectId = production.project_id;
   const productMode = Boolean(production.product_image_filename);
   const projectStyle = production.style ?? ""; // global rendering medium, applied to every shot
+  const aspect = production.aspect_ratio || "16:9"; // drives keyframe + Veo aspect
 
   const doKeyframe = !opts.videoOnly;
   const doVideo = !opts.keyframeOnly;
@@ -400,7 +506,7 @@ async function processShot(
     const prompt = await composeKeyframePrompt(shot, projectStyle, productInShot, refUrls.length > 0, deps, opts.dryRun, opts.notes);
 
     if (opts.dryRun) {
-      const filename = await synthPlaceholderImage(shot, projectId);
+      const filename = await synthPlaceholderImage(shot, projectId, aspect);
       keyframeRefUrl = mediaUrlAbsolute(filename);
       db.updateProductionShot(shotId, {
         status: "keyframe_done",
@@ -409,10 +515,12 @@ async function processShot(
         take_count: shot.take_count + 1,
       });
     } else {
-      const { taskId } = await kie.createImageTask(prompt, opts.imageModel, refUrls, "16:9");
-      db.updateProductionShot(shotId, { keyframe_task_id: taskId });
-      const cdnUrl = await pollImageToUrl(taskId);
-      const filename = await storage.saveImage(cdnUrl, `keyframe_${taskId}`, projectId);
+      const cdnUrl = await trackCredits(production.id, () => withTransientRetry(`keyframe (shot ${shot.shot_number})`, async () => {
+        const { taskId } = await kie.createImageTask(prompt, opts.imageModel, refUrls, aspect as kie.AspectRatio);
+        db.updateProductionShot(shotId, { keyframe_task_id: taskId });
+        return pollImageToUrl(taskId);
+      }));
+      const filename = await storage.saveImage(cdnUrl, `keyframe_${Date.now()}`, projectId);
       keyframeRefUrl = cdnUrl; // kie CDN url — publicly fetchable for the video stage
       db.updateProductionShot(shotId, {
         status: "keyframe_done",
@@ -431,7 +539,7 @@ async function processShot(
     // Freeze/still shots hold the keyframe — no Veo call, in dry run or for real.
     if (shot.is_still) {
       const secs = parseSeconds(shot.duration_hint) ?? 2;
-      const filename = await synthStillFromKeyframe(shot, projectId, secs);
+      const filename = await synthStillFromKeyframe(shot, projectId, secs); // holds the keyframe, so it inherits its aspect
       db.updateProductionShot(shotId, { status: "video_done", video_filename: filename, video_task_id: "still" });
       return;
     }
@@ -439,7 +547,7 @@ async function processShot(
     const prompt = await composeVideoPrompt(shot, projectStyle, productMode, deps, opts.dryRun, opts.notes);
 
     if (opts.dryRun) {
-      const filename = await synthPlaceholderVideo(shot, projectId);
+      const filename = await synthPlaceholderVideo(shot, projectId, aspect);
       db.updateProductionShot(shotId, {
         status: "video_done",
         video_filename: filename,
@@ -449,14 +557,32 @@ async function processShot(
       // Reference image must be a kie-fetchable URL: the freshly generated keyframe's CDN url,
       // or the one persisted from when the keyframe was made. The local /api/media path is NOT
       // reachable by kie's servers, so never fall back to it.
-      if (!keyframeRefUrl) keyframeRefUrl = shot.keyframe_url;
+      // A video-only retry skips the keyframe stage entirely, so this falls back to the
+      // persisted url — which may be a kie CDN link generated days ago. Freshen it the same
+      // way every other reference (hero/character/background/carried keyframe) already is.
+      if (!keyframeRefUrl && shot.keyframe_url) {
+        keyframeRefUrl = await freshenUrl(shot.keyframe_url, shot.keyframe_filename);
+      }
       if (!keyframeRefUrl) {
         throw new Error("No fetchable keyframe reference — regenerate the keyframe (retry with 'Keyframe + clip').");
       }
-      const { taskId } = await kie.createVideoTask(prompt, [keyframeRefUrl], opts.quality);
-      db.updateProductionShot(shotId, { video_task_id: taskId });
-      const cdnUrl = await pollVideoToUrl(taskId);
-      const filename = await storage.saveVideo(cdnUrl, `clip_${taskId}`, projectId);
+      const engine = opts.videoEngine ?? "veo";
+      const cdnUrl = await trackCredits(production.id, () => withTransientRetry(`clip (shot ${shot.shot_number}, ${engine})`, async () => {
+        if (engine === "kling") {
+          const { taskId } = await kie.createKlingVideoTask(prompt, keyframeRefUrl!, { aspectRatio: aspect as "16:9" | "9:16" });
+          db.updateProductionShot(shotId, { video_task_id: taskId });
+          return pollMarketVideoToUrl(taskId);
+        }
+        if (engine === "seedance") {
+          const { taskId } = await kie.createSeedanceVideoTask(prompt, keyframeRefUrl!, { aspectRatio: aspect });
+          db.updateProductionShot(shotId, { video_task_id: taskId });
+          return pollMarketVideoToUrl(taskId);
+        }
+        const { taskId } = await kie.createVideoTask(prompt, [keyframeRefUrl!], opts.quality, aspect as kie.VideoAspect);
+        db.updateProductionShot(shotId, { video_task_id: taskId });
+        return pollVideoToUrl(taskId);
+      }));
+      const filename = await storage.saveVideo(cdnUrl, `clip_${Date.now()}`, projectId);
       db.updateProductionShot(shotId, { status: "video_done", video_filename: filename });
 
       // Fix 3: grab the final frame of this clip and upload to kie so the next shot
@@ -507,6 +633,8 @@ async function runProduction(productionId: number, deps: ProduceDeps, opts: Shot
 
       // Fix 2: auto scene grouping — before generating this shot's keyframe, anchor it to
       // the first completed keyframe in its scene (if no manual ref_shot is already set).
+      // Uses loose equality deliberately: ref_shot === 0 (explicit "no continuity") is NOT
+      // null, so this correctly skips auto-anchoring a shot the user turned continuity off for.
       if (shot.scene_id && shot.ref_shot == null) {
         const allShots = db.getProductionShots(productionId);
         const anchor = allShots.find(s =>
@@ -645,10 +773,12 @@ export function registerProduceRoutes(app: Express, upload: Multer, deps: Produc
     if (!production) return res.status(404).json({ error: "Production not found" });
     const { prompt, dryRun } = req.body as { prompt?: string; dryRun?: boolean };
     try {
+      const heroAspect = (production.aspect_ratio || "16:9") as kie.AspectRatio;
       if (dryRun) {
+        const dims = heroAspect === "9:16" ? "720x1280" : "1280x720";
         const name = `hero_dry_${id}_${Date.now()}.png`;
         const { absPath, relPath } = storage.reserveMediaPath(name, "images", production.project_id);
-        await runFfmpeg(["-y", "-f", "lavfi", "-i", "color=c=slateblue:s=1280x720:d=1", "-frames:v", "1", absPath]);
+        await runFfmpeg(["-y", "-f", "lavfi", "-i", `color=c=slateblue:s=${dims}:d=1`, "-frames:v", "1", absPath]);
         db.updateProduction(id, { hero_ref_filename: relPath, hero_ref_url: mediaUrlAbsolute(relPath) });
         return res.json({ status: "done", filename: relPath });
       }
@@ -656,7 +786,7 @@ export function registerProduceRoutes(app: Express, upload: Multer, deps: Produc
       let finalPrompt = prompt;
       if (deps.isPromptEngineerEnabled()) finalPrompt = await deps.engineerPrompt(prompt, "image", deps.getCharacters(), production.style ?? "");
       if (production.style) finalPrompt = `${finalPrompt}\n\nRendering style: ${production.style}.`;
-      const { taskId } = await kie.createImageTask(finalPrompt, "nano-banana-2", [], "16:9");
+      const { taskId } = await kie.createImageTask(finalPrompt, "nano-banana-2", [], heroAspect);
       res.json({ taskId });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -677,6 +807,31 @@ export function registerProduceRoutes(app: Express, upload: Multer, deps: Produc
       }
       if (result.status === "failed") return res.json({ status: "failed", error: result.errorMessage });
       res.json({ status: "pending" });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // Generate a hero still FROM real product photos (1-3 angles) instead of a text prompt —
+  // uploads each photo to kie, then asks nano-banana-2 to produce a clean, production-ready
+  // still using them as references. Polled via the same /hero-poll endpoint above (it doesn't
+  // care how the taskId's generation was seeded).
+  app.post("/api/productions/:id/hero-from-photos", upload.array("files", 3), async (req, res) => {
+    const id = Number(req.params.id);
+    const production = db.getProduction(id);
+    if (!production) return res.status(404).json({ error: "Production not found" });
+    const files = (req as unknown as { files?: { buffer: Buffer; originalname: string; mimetype?: string }[] }).files;
+    if (!files || files.length === 0) return res.status(400).json({ error: "Missing photo(s)" });
+    const { notes } = req.body as { notes?: string };
+    try {
+      const photoUrls = await Promise.all(files.map((file, i) => {
+        const ext = (file.originalname.match(/\.[a-z0-9]+$/i)?.[0]) || ".png";
+        const mime = file.mimetype || "image/png";
+        return kie.uploadImageBase64(`data:${mime};base64,${file.buffer.toString("base64")}`, `hero_src_${Date.now()}_${i}${ext}`);
+      }));
+      const heroAspect = (production.aspect_ratio || "16:9") as kie.AspectRatio;
+      const { taskId } = await kie.createImageTask(heroFromPhotosPrompt(notes), "nano-banana-2", photoUrls, heroAspect);
+      res.json({ taskId });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -704,11 +859,41 @@ export function registerProduceRoutes(app: Express, upload: Multer, deps: Produc
     }
   });
 
+  // Set the target platform + aspect ratio for a production.
+  app.post("/api/productions/:id/platform", (req, res) => {
+    const id = Number(req.params.id);
+    if (!db.getProduction(id)) return res.status(404).json({ error: "Production not found" });
+    const { platform, aspectRatio } = req.body as { platform?: string; aspectRatio?: string };
+    if (platform !== undefined) db.updateProduction(id, { platform: platform || null });
+    if (aspectRatio === "9:16" || aspectRatio === "16:9") db.updateProduction(id, { aspect_ratio: aspectRatio });
+    res.json({ ok: true });
+  });
+
   // Set the global rendering style (appended to every keyframe + video prompt).
   app.post("/api/productions/:id/style", (req, res) => {
     const id = Number(req.params.id);
     if (!db.getProduction(id)) return res.status(404).json({ error: "Production not found" });
     db.updateProduction(id, { style: (req.body?.style ?? "").trim() || null });
+    res.json({ ok: true });
+  });
+
+  // Rename a production (e.g. to tell apart several Ad Pack angles for the same campaign).
+  app.post("/api/productions/:id/title", (req, res) => {
+    const id = Number(req.params.id);
+    if (!db.getProduction(id)) return res.status(404).json({ error: "Production not found" });
+    const title = (req.body?.title ?? "").trim();
+    if (!title) return res.status(400).json({ error: "Missing title" });
+    db.updateProduction(id, { title });
+    res.json({ ok: true });
+  });
+
+  // Hide a production from the Costs page's per-production list once reviewed. The credits it
+  // spent still count toward the grand total / by-project rollups — only the itemised row hides.
+  app.post("/api/productions/:id/clear-cost", (req, res) => {
+    const id = Number(req.params.id);
+    if (!db.getProduction(id)) return res.status(404).json({ error: "Production not found" });
+    const cleared = req.body?.cleared !== false; // default true (clear); pass {cleared:false} to restore
+    db.updateProduction(id, { cost_cleared: cleared ? 1 : 0 });
     res.json({ ok: true });
   });
 
@@ -728,9 +913,11 @@ export function registerProduceRoutes(app: Express, upload: Multer, deps: Produc
     if (running.has(id)) return res.status(409).json({ error: "Production already running" });
 
     const stageReq = req.body?.stage;
+    const videoEngineReq = req.body?.videoEngine;
     const opts: ShotOptions = {
       dryRun: Boolean(req.body?.dryRun),
-      quality: (req.body?.quality === "quality" ? "quality" : "fast") as kie.VideoQuality,
+      quality: (req.body?.quality === "quality" ? "quality" : req.body?.quality === "lite" ? "lite" : "fast") as kie.VideoQuality,
+      videoEngine: (videoEngineReq === "kling" || videoEngineReq === "seedance" ? videoEngineReq : "veo") as ShotOptions["videoEngine"],
       imageModel: (req.body?.imageModel === "google/nano-banana" ? "google/nano-banana" : "nano-banana-2") as kie.ImageModel,
       stage: (stageReq === "keyframes" || stageReq === "videos" ? stageReq : "all") as Stage,
     };
@@ -755,15 +942,16 @@ export function registerProduceRoutes(app: Express, upload: Multer, deps: Produc
     if (!production) return res.status(404).json({ error: "Production not found" });
     if (running.has(id)) return res.status(409).json({ error: "Production is running — stop it first" });
 
-    const { shotId, keyframeOnly, videoOnly, notes, dryRun, quality, imageModel } = req.body as {
-      shotId?: number; keyframeOnly?: boolean; videoOnly?: boolean; notes?: string; dryRun?: boolean; quality?: string; imageModel?: string;
+    const { shotId, keyframeOnly, videoOnly, notes, dryRun, quality, imageModel, videoEngine } = req.body as {
+      shotId?: number; keyframeOnly?: boolean; videoOnly?: boolean; notes?: string; dryRun?: boolean; quality?: string; imageModel?: string; videoEngine?: string;
     };
     const shot = shotId ? db.getProductionShot(Number(shotId)) : null;
     if (!shot || shot.production_id !== id) return res.status(400).json({ error: "Invalid shotId" });
 
     const opts: ShotOptions = {
       dryRun: Boolean(dryRun),
-      quality: (quality === "quality" ? "quality" : "fast") as kie.VideoQuality,
+      quality: (quality === "quality" ? "quality" : quality === "lite" ? "lite" : "fast") as kie.VideoQuality,
+      videoEngine: (videoEngine === "kling" || videoEngine === "seedance" ? videoEngine : "veo") as ShotOptions["videoEngine"],
       imageModel: (imageModel === "google/nano-banana" ? "google/nano-banana" : "nano-banana-2") as kie.ImageModel,
       keyframeOnly: Boolean(keyframeOnly),
       videoOnly: Boolean(videoOnly),
@@ -802,9 +990,13 @@ export function registerProduceRoutes(app: Express, upload: Multer, deps: Produc
         hero_ref_filename: src.hero_ref_filename,
         hero_ref_url: src.hero_ref_url,
         style: src.style,
+        style_ref_url: src.style_ref_url,
+        platform: src.platform,
+        aspect_ratio: src.aspect_ratio,
+        content_style: src.content_style,
       });
       db.getProductionShots(src.id).forEach(s => {
-        db.createProductionShot(copy.id, {
+        const copyShot = db.createProductionShot(copy.id, {
           shot_number: s.shot_number,
           description: s.description,
           image_prompt: s.image_prompt,
@@ -812,6 +1004,14 @@ export function registerProduceRoutes(app: Express, upload: Multer, deps: Produc
           camera_shot: s.camera_shot,
           duration_hint: s.duration_hint,
           label_visible: s.label_visible !== 0,
+          scene_id: s.scene_id, // keep scene grouping so continuity (Fix 2/3) still works after duplicate
+        });
+        // Carry the creative/structural per-shot choices; run outputs (keyframes, last-frames) stay reset.
+        db.updateProductionShot(copyShot.id, {
+          is_still: s.is_still,
+          use_character: s.use_character,
+          bg_asset_id: s.bg_asset_id,
+          ref_shot: s.ref_shot,
         });
       });
       res.json({ production: copy, shots: db.getProductionShots(copy.id) });
@@ -828,6 +1028,82 @@ export function registerProduceRoutes(app: Express, upload: Multer, deps: Produc
     if (!shot || shot.production_id !== id) return res.status(400).json({ error: "Invalid shotId" });
     db.updateProductionShot(shot.id, { duration_hint: (duration ?? "").trim() || null });
     res.json({ ok: true });
+  });
+
+  // Edit a shot's script text (description / image prompt / video prompt).
+  app.post("/api/productions/:id/shot-edit", (req, res) => {
+    const id = Number(req.params.id);
+    const { shotId, description, image_prompt, video_prompt } = req.body as {
+      shotId?: number; description?: string; image_prompt?: string; video_prompt?: string;
+    };
+    const shot = shotId ? db.getProductionShot(Number(shotId)) : null;
+    if (!shot || shot.production_id !== id) return res.status(400).json({ error: "Invalid shotId" });
+    const fields: Record<string, unknown> = {};
+    if (description !== undefined) fields.description = description;
+    if (image_prompt !== undefined) fields.image_prompt = image_prompt;
+    if (video_prompt !== undefined) fields.video_prompt = video_prompt;
+    db.updateProductionShot(shot.id, fields);
+    res.json({ ok: true });
+  });
+
+  // Insert a brand-new shot (e.g. an extra product demo) between existing ones. afterShotNumber
+  // = 0 inserts at the very start. Renumbers everything after it, and fixes up any ref_shot
+  // pointers so scene-continuity references still point at the correct (shifted) shot.
+  app.post("/api/productions/:id/shots/insert", (req, res) => {
+    const id = Number(req.params.id);
+    if (!db.getProduction(id)) return res.status(404).json({ error: "Production not found" });
+    const { afterShotNumber, description, duration, labelVisible } = req.body as {
+      afterShotNumber?: number; description?: string; duration?: string; labelVisible?: boolean;
+    };
+    if (!description?.trim()) return res.status(400).json({ error: "Missing description" });
+    const after = Math.max(0, Number(afterShotNumber) || 0);
+    const newNumber = after + 1;
+
+    const shots = db.getProductionShots(id);
+    // Shift everything at/after the new slot up by one — descending order so no intermediate
+    // shot_number collides with one not yet moved (harmless here since there's no unique
+    // constraint, but keeps the sequence sane to reason about).
+    shots
+      .filter(s => s.shot_number >= newNumber)
+      .sort((a, b) => b.shot_number - a.shot_number)
+      .forEach(s => db.updateProductionShot(s.id, { shot_number: s.shot_number + 1 }));
+    // Any manual scene-continuity reference pointing at a shot that just shifted must shift too.
+    shots.forEach(s => {
+      if (s.ref_shot != null && s.ref_shot >= newNumber) {
+        db.updateProductionShot(s.id, { ref_shot: s.ref_shot + 1 });
+      }
+    });
+
+    const shot = db.createProductionShot(id, {
+      shot_number: newNumber,
+      description: description.trim(),
+      duration_hint: duration?.trim() || null,
+      label_visible: labelVisible ?? true,
+    });
+    res.json({ ok: true, shot, shots: db.getProductionShots(id) });
+  });
+
+  // Delete a shot. Renumbers everything after it down by one and clears/shifts any ref_shot
+  // pointers so continuity references never dangle or point at the wrong shot.
+  app.post("/api/productions/:id/shots/:shotId/delete", (req, res) => {
+    const id = Number(req.params.id);
+    if (!db.getProduction(id)) return res.status(404).json({ error: "Production not found" });
+    const shot = db.getProductionShot(Number(req.params.shotId));
+    if (!shot || shot.production_id !== id) return res.status(400).json({ error: "Invalid shotId" });
+
+    const removedNumber = shot.shot_number;
+    const shots = db.getProductionShots(id);
+    db.deleteProductionShot(shot.id);
+    shots.forEach(s => {
+      if (s.id === shot.id) return;
+      if (s.ref_shot === removedNumber) db.updateProductionShot(s.id, { ref_shot: null });
+      else if (s.ref_shot != null && s.ref_shot > removedNumber) db.updateProductionShot(s.id, { ref_shot: s.ref_shot - 1 });
+    });
+    shots
+      .filter(s => s.id !== shot.id && s.shot_number > removedNumber)
+      .sort((a, b) => a.shot_number - b.shot_number)
+      .forEach(s => db.updateProductionShot(s.id, { shot_number: s.shot_number - 1 }));
+    res.json({ ok: true, shots: db.getProductionShots(id) });
   });
 
   // Toggle a shot as a still/freeze (holds the keyframe instead of animating with Veo).
@@ -862,8 +1138,13 @@ export function registerProduceRoutes(app: Express, upload: Multer, deps: Produc
     const { shotId, refShot } = req.body as { shotId?: number; refShot?: number | null };
     const shot = shotId ? db.getProductionShot(Number(shotId)) : null;
     if (!shot || shot.production_id !== id) return res.status(400).json({ error: "Invalid shotId" });
-    // Only allow carrying from an EARLIER shot (its keyframe exists first in the keyframes stage).
-    const ref = refShot && Number(refShot) < shot.shot_number ? Number(refShot) : null;
+    // 0 = explicit "no continuity" override (must be preserved, not coerced to null — a plain
+    // truthy check would treat 0 as "unset"). A positive number must be an EARLIER shot (its
+    // keyframe exists first in the keyframes stage). null/undefined = auto (pipeline decides).
+    let ref: number | null;
+    if (refShot === 0) ref = 0;
+    else if (refShot != null && Number(refShot) < shot.shot_number) ref = Number(refShot);
+    else ref = null;
     db.updateProductionShot(shot.id, { ref_shot: ref });
     res.json({ ok: true });
   });

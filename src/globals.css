@@ -14,3 +14,12 @@ body {
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
+
+/* Give every text field a visible fill so it reads as a box against the white page —
+   most inputs are styled bg-white, which is invisible on a white background.
+   !important is needed to win over the per-component bg-white utility classes. */
+input:not([type="checkbox"]):not([type="radio"]),
+textarea,
+select {
+  background-color: #f3f4f6 !important; /* gray-100 */
+}

@@ -51,12 +51,43 @@ function parseSeconds(hint: string | null): number | null {
   return n > 0 ? n : null;
 }
 
+// Kling/Seedance clips are generated with sound/audio disabled and carry no audio stream at
+// all — blindly mapping [i:a] for one of these fails the whole filtergraph ("Stream specifier
+// ':a' ... matches no streams"). Probe each clip so we know which ones need a synthetic track.
+function probeHasAudio(absPath: string): Promise<boolean> {
+  return new Promise(resolve => {
+    const proc = spawn(FFMPEG, ["-i", absPath], { windowsHide: true });
+    let stderr = "";
+    proc.stderr.on("data", d => { stderr += d.toString(); });
+    const done = () => resolve(/Stream #\d+:\d+.*: Audio:/.test(stderr));
+    proc.on("error", () => resolve(false));
+    proc.on("close", done);
+  });
+}
+
+// Duration of a clip that has no scripted duration_hint (used to size its synthetic silent
+// track so it matches the video length instead of guessing).
+function probeDuration(absPath: string): Promise<number> {
+  return new Promise(resolve => {
+    const proc = spawn(FFMPEG, ["-i", absPath], { windowsHide: true });
+    let stderr = "";
+    proc.stderr.on("data", d => { stderr += d.toString(); });
+    const done = () => {
+      const m = stderr.match(/Duration:\s*(\d+):(\d+):(\d+\.\d+)/);
+      resolve(m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : 8);
+    };
+    proc.on("error", () => resolve(8));
+    proc.on("close", done);
+  });
+}
+
 // ── Assembly ──────────────────────────────────────────────────────────────────
 
 // Concatenate all completed clips of a production into one MP4.
 // Re-encodes (rather than stream-copies) so mixed sources with different codecs/
 // resolutions concat cleanly: h264/yuv420p, scaled+padded to the first clip's size.
-// Clips are assumed to carry an audio track (Veo output does; dry-run placeholders do too).
+// Clips without an audio stream (e.g. Kling/Seedance generated with sound off) get a
+// synthetic silent track — see probeHasAudio/probeDuration above.
 export async function assembleProduction(productionId: number, musicOnly = false, fullClips = false): Promise<string> {
   const production = db.getProduction(productionId);
   if (!production) throw new Error("Production not found");
@@ -80,20 +111,35 @@ export async function assembleProduction(productionId: number, musicOnly = false
   try {
     const { width: W, height: H } = await probeResolution(clipPaths[0]);
     const N = clipPaths.length;
+    const hasAudio = await Promise.all(clipPaths.map(p => probeHasAudio(p)));
+    const effSecs = shots.map(s => (fullClips ? null : parseSeconds(s.duration_hint)));
 
     // Honour the scripted per-shot durations by trimming each clip (Veo always renders ~8s).
     // `-t <sec>` before `-i` limits how much of that input is read; a hint longer than the clip
     // is harmless (ffmpeg just reads the whole clip).
     const inputs: string[] = [];
     shots.forEach((s, i) => {
-      const secs = fullClips ? null : parseSeconds(s.duration_hint);
-      if (secs) inputs.push("-t", String(secs));
+      if (effSecs[i]) inputs.push("-t", String(effSecs[i]));
       inputs.push("-i", clipPaths[i]);
     });
 
     // Music is looped so it can cover the full timeline; -shortest / amix trims it back.
     const musIdx = N;
     if (musicPath) inputs.push("-stream_loop", "-1", "-i", musicPath);
+
+    // Clips without an audio stream (Kling/Seedance generated with sound disabled) get a
+    // synthetic silent track appended as an extra input, sized to match that clip's own
+    // (possibly trimmed) duration so it lines up in the concat below.
+    const silentAudioIdx: (number | null)[] = [];
+    let nextIdx = musicPath ? musIdx + 1 : musIdx;
+    for (let i = 0; i < N; i++) {
+      if (hasAudio[i]) { silentAudioIdx.push(null); continue; }
+      const dur = effSecs[i] ?? await probeDuration(clipPaths[i]);
+      inputs.push("-f", "lavfi", "-t", String(dur), "-i", "anullsrc=r=44100:cl=stereo");
+      silentAudioIdx.push(nextIdx);
+      nextIdx++;
+    }
+    const audioRef = (i: number) => (hasAudio[i] ? `${i}:a` : `${silentAudioIdx[i]}:a`);
 
     // Scale + pad each clip to a uniform canvas.
     const scale = clipPaths.map((_, i) =>
@@ -112,8 +158,8 @@ export async function assembleProduction(productionId: number, musicOnly = false
       maps.push("-map", "[vout]", "-map", `${musIdx}:a`);
       outArgs.push("-shortest");
     } else {
-      // Interleave scaled video with each clip's own audio, then concat both streams.
-      const interleave = clipPaths.map((_, i) => `[v${i}][${i}:a]`).join("");
+      // Interleave scaled video with each clip's own (or synthetic silent) audio, then concat both streams.
+      const interleave = clipPaths.map((_, i) => `[v${i}][${audioRef(i)}]`).join("");
       const concat = `${interleave}concat=n=${N}:v=1:a=1[vout][aconcat]`;
       if (musicPath) {
         // Mix music under the clip audio at reduced volume.

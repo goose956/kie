@@ -5,6 +5,17 @@ import { useCallback, useEffect, useRef, useState } from "react";
 type ProductionStatus = "draft" | "producing" | "review" | "assembling" | "done" | "failed";
 type ShotStatus = "pending" | "keyframe" | "keyframe_done" | "video" | "video_done" | "failed" | "skipped";
 
+// One combined "video engine" choice covering Veo's tiers plus the alternate providers we're
+// cost/quality-testing (Kling, Seedance) — priced roughly cheapest to priciest per ~8s clip.
+type EngineChoice = "veo-lite" | "veo-fast" | "seedance" | "kling" | "veo-quality";
+
+// Derives the two wire-format fields (quality + videoEngine) the backend expects from one choice.
+function engineParams(e: EngineChoice): { quality: string; videoEngine: string } {
+  if (e === "kling") return { quality: "fast", videoEngine: "kling" };
+  if (e === "seedance") return { quality: "fast", videoEngine: "seedance" };
+  return { quality: e.replace("veo-", ""), videoEngine: "veo" }; // veo-lite/fast/quality → lite/fast/quality
+}
+
 interface Production {
   id: number;
   project_id: number | null;
@@ -17,10 +28,17 @@ interface Production {
   hero_ref_url: string | null;
   style: string | null;
   style_ref_url: string | null;
+  platform: string | null;
+  aspect_ratio: string;
+  content_style: string | null;
+  credits_spent: number;
   final_video_filename: string | null;
   error: string | null;
   created_at: string;
 }
+
+// Same kie credit-to-USD peg used in CostsPanel (80cr=$0.40, 60cr=$0.30, 400cr=$2.00 → $0.005/credit).
+const USD_PER_CREDIT = 0.005;
 
 interface ProductionShot {
   id: number;
@@ -80,11 +98,10 @@ const ACTIVE_STATUSES: ProductionStatus[] = ["producing", "assembling"];
 
 // ── Per-shot retry control ─────────────────────────────────────────────────────
 
-function RetryShot({ productionId, shot, dryRun, quality, imageModel, disabled, onDone }: {
+function RetryShot({ productionId, shot, engine, imageModel, disabled, onDone }: {
   productionId: number;
   shot: ProductionShot;
-  dryRun: boolean;
-  quality: string;
+  engine: EngineChoice;
   imageModel: string;
   disabled: boolean;
   onDone: () => void;
@@ -104,9 +121,8 @@ function RetryShot({ productionId, shot, dryRun, quality, imageModel, disabled, 
           keyframeOnly: scope === "keyframe",
           videoOnly: scope === "video",
           notes,
-          dryRun,
-          quality,
           imageModel,
+          ...engineParams(engine),
         }),
       });
       setOpen(false); setNotes("");
@@ -147,22 +163,90 @@ function RetryShot({ productionId, shot, dryRun, quality, imageModel, disabled, 
   );
 }
 
+// ── Insert a manual shot (e.g. an extra product demo) between existing ones ────
+
+function InsertShotSlot({ productionId, afterShotNumber, disabled, onDone }: {
+  productionId: number;
+  afterShotNumber: number;
+  disabled: boolean;
+  onDone: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [description, setDescription] = useState("");
+  const [duration, setDuration] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit() {
+    if (!description.trim()) return;
+    setBusy(true);
+    try {
+      await fetch(`/api/productions/${productionId}/shots/insert`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ afterShotNumber, description, duration: duration || undefined }),
+      });
+      setOpen(false); setDescription(""); setDuration("");
+      onDone();
+    } finally { setBusy(false); }
+  }
+
+  if (!open) {
+    return (
+      <div className="flex items-center gap-2 py-0.5 group">
+        <div className="flex-1 border-t border-dashed border-gray-200 group-hover:border-gray-300" />
+        <button onClick={() => setOpen(true)} disabled={disabled}
+          className="text-[9px] text-gray-300 hover:text-gray-600 disabled:opacity-30 transition-colors">
+          + insert shot
+        </button>
+        <div className="flex-1 border-t border-dashed border-gray-200 group-hover:border-gray-300" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="my-1 p-2 rounded-lg border border-blue-200 bg-blue-50 space-y-1.5">
+      <textarea value={description} onChange={e => setDescription(e.target.value)} rows={2} autoFocus
+        placeholder="Describe the new shot (e.g. close-up demo of the product's zip pocket)…"
+        className="w-full bg-white border border-gray-300 rounded px-2 py-1 text-[11px] text-black placeholder-gray-400 resize-none focus:outline-none" />
+      <div className="flex gap-2 items-center">
+        <input value={duration} onChange={e => setDuration(e.target.value)} placeholder="duration e.g. 3s"
+          className="w-24 bg-white border border-gray-300 rounded px-2 py-1 text-[10px] text-black placeholder-gray-400 focus:outline-none" />
+        <button onClick={submit} disabled={busy || !description.trim()}
+          className="flex-1 bg-blue-500 text-white text-[10px] font-semibold rounded py-1 hover:bg-blue-400 disabled:opacity-40 transition-colors">
+          {busy ? "Adding…" : "Add shot"}
+        </button>
+        <button onClick={() => { setOpen(false); setDescription(""); setDuration(""); }}
+          className="px-2 text-[10px] text-gray-500 hover:text-gray-800">Cancel</button>
+      </div>
+      <p className="text-[9px] text-gray-400">Added as a pending shot — use Retry below it to generate the keyframe + clip.</p>
+    </div>
+  );
+}
+
 // ── Main panel ─────────────────────────────────────────────────────────────────
 
 export default function ProducePanel({ projectId, selectedId, onSelect }: Props) {
   const [list, setList] = useState<Production[]>([]);
   const [full, setFull] = useState<FullProduction | null>(null);
-  const [dryRun, setDryRun] = useState(true);
-  const [quality, setQuality] = useState("fast");
+  const [engine, setEngine] = useState<EngineChoice>("veo-fast");
   const [imageModel, setImageModel] = useState("nano-banana-2");
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
   const [heroPrompt, setHeroPrompt] = useState("");
+  const [heroPhotoFiles, setHeroPhotoFiles] = useState<File[]>([]);
+  const [heroPhotoNotes, setHeroPhotoNotes] = useState("");
+  const heroPhotoInputRef = useRef<HTMLInputElement>(null);
+  const [charPrompt, setCharPrompt] = useState("");
   const [charRef, setCharRef] = useState<{ name: string; image: string | null; url: string | null } | null>(null);
   const [hover, setHover] = useState<{ url: string; type: "image" | "video" } | null>(null);
+  const [editingShot, setEditingShot] = useState<number | null>(null);
+  const [deleteConfirmId, setDeleteConfirmId] = useState<number | null>(null);
+  const [renamingId, setRenamingId] = useState<number | null>(null);
+  const [renameValue, setRenameValue] = useState("");
   const [library, setLibrary] = useState<LibraryAsset[]>([]);
   const [saveKind, setSaveKind] = useState<null | "character" | "product">(null);
   const [saveName, setSaveName] = useState("");
+  const [templateNameOpen, setTemplateNameOpen] = useState(false);
+  const [templateName, setTemplateName] = useState("");
   const [bgName, setBgName] = useState("");
   const [bgPrompt, setBgPrompt] = useState("");
   const [auditResults, setAuditResults] = useState<Array<{ shot_number: number; issue: string; suggestion: string }> | null>(null);
@@ -175,6 +259,17 @@ export default function ProducePanel({ projectId, selectedId, onSelect }: Props)
     const res = await fetch(url);
     setList(await res.json());
   }, [projectId]);
+
+  async function renameProduction(id: number, title: string) {
+    if (!title.trim()) { setRenamingId(null); return; }
+    await fetch(`/api/productions/${id}/title`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: title.trim() }),
+    });
+    setRenamingId(null);
+    await loadList();
+    if (full?.production.id === id) await loadFull();
+  }
 
   const loadFull = useCallback(async () => {
     if (selectedId == null) { setFull(null); return; }
@@ -222,7 +317,7 @@ export default function ProducePanel({ projectId, selectedId, onSelect }: Props)
   async function produce(stage: "keyframes" | "videos" | "all") {
     if (!full) return;
     setBusy(stage);
-    try { await post(`/api/productions/${full.production.id}/produce`, { dryRun, quality, imageModel, stage }); await loadFull(); }
+    try { await post(`/api/productions/${full.production.id}/produce`, { ...engineParams(engine), imageModel, stage }); await loadFull(); }
     catch (e) { setError(String(e)); }
     finally { setBusy(""); }
   }
@@ -263,25 +358,57 @@ export default function ProducePanel({ projectId, selectedId, onSelect }: Props)
     catch (e) { setError(String(e)); }
   }
 
+  // Shared poller for any hero generation, however it was seeded (text prompt or real photos) —
+  // /hero-poll doesn't care how the taskId's generation started.
+  function pollHeroTask(taskId: string, onDone?: () => void) {
+    if (!full) return;
+    const productionId = full.production.id;
+    let attempts = 0;
+    const step = async () => {
+      if (attempts++ > 60) { setError("Hero generation timed out"); setBusy(""); return; }
+      const r = await fetch(`/api/productions/${productionId}/hero-poll?taskId=${taskId}`);
+      const d = await r.json();
+      if (d.error) { setError(d.error); setBusy(""); return; }
+      if (d.status === "done") { onDone?.(); await loadFull(); setBusy(""); return; }
+      if (d.status === "failed") { setError(d.error || "Hero generation failed"); setBusy(""); return; }
+      setTimeout(step, 3000);
+    };
+    step();
+  }
+
   async function generateHero() {
     if (!full) return;
     setBusy("hero"); setError("");
     try {
-      const data = await post(`/api/productions/${full.production.id}/hero`, { prompt: heroPrompt, dryRun });
+      const data = await post(`/api/productions/${full.production.id}/hero`, { prompt: heroPrompt });
       if (data.status === "done") { await loadFull(); setBusy(""); return; } // dry-run path
-      const taskId = data.taskId;
-      let attempts = 0;
-      const pollHero = async () => {
-        if (attempts++ > 60) { setError("Hero generation timed out"); setBusy(""); return; }
-        const r = await fetch(`/api/productions/${full.production.id}/hero-poll?taskId=${taskId}`);
-        const d = await r.json();
-        if (d.error) { setError(d.error); setBusy(""); return; }
-        if (d.status === "done") { setHeroPrompt(""); await loadFull(); setBusy(""); return; }
-        if (d.status === "failed") { setError(d.error || "Hero generation failed"); setBusy(""); return; }
-        setTimeout(pollHero, 3000);
-      };
-      pollHero();
+      pollHeroTask(data.taskId, () => setHeroPrompt(""));
     } catch (e) { setError(String(e)); setBusy(""); }
+  }
+
+  async function generateHeroFromPhotos() {
+    if (!full || heroPhotoFiles.length === 0) return;
+    setBusy("hero-photos"); setError("");
+    try {
+      const form = new FormData();
+      heroPhotoFiles.forEach(f => form.append("files", f));
+      form.append("notes", heroPhotoNotes);
+      const res = await fetch(`/api/productions/${full.production.id}/hero-from-photos`, { method: "POST", body: form });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      pollHeroTask(data.taskId, () => { setHeroPhotoFiles([]); setHeroPhotoNotes(""); });
+    } catch (e) { setError(String(e)); setBusy(""); }
+  }
+
+  async function suggestHeroPrompt() {
+    if (!full) return;
+    setBusy("suggest");
+    try {
+      const ctx = `Ad: ${full.production.title}. Style: ${full.production.style || "n/a"}. Shots: ${full.shots.map(s => s.description || s.image_prompt).filter(Boolean).slice(0, 8).join(" | ")}`;
+      const data = await post("/api/ad/suggest-prompt", { kind: "hero", context: ctx });
+      if (data.prompt) setHeroPrompt(data.prompt);
+    } catch (e) { setError(String(e)); }
+    finally { setBusy(""); }
   }
 
   async function clearHero() {
@@ -289,6 +416,54 @@ export default function ProducePanel({ projectId, selectedId, onSelect }: Props)
     setBusy("hero-clear");
     try { await post(`/api/productions/${full.production.id}/hero-clear`); await loadFull(); }
     catch (e) { setError(String(e)); }
+    finally { setBusy(""); }
+  }
+
+  async function generateCharacter() {
+    if (!full || projectId == null || !charPrompt.trim()) return;
+    setBusy("char"); setError("");
+    try {
+      const res = await fetch("/api/projects/generate-character", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId, prompt: charPrompt }),
+      });
+      const { taskId, error } = await res.json();
+      if (error) throw new Error(error);
+      let attempts = 0;
+      const poll = async () => {
+        if (attempts++ > 60) { setError("Character generation timed out"); setBusy(""); return; }
+        const r = await fetch(`/api/projects/poll-character?taskId=${taskId}&projectId=${projectId}`);
+        const d = await r.json();
+        if (d.error) { setError(d.error); setBusy(""); return; }
+        if (d.status === "done") { setCharPrompt(""); loadCharRef(); setBusy(""); return; }
+        if (d.status === "failed") { setError(d.error || "Character generation failed"); setBusy(""); return; }
+        setTimeout(poll, 3000);
+      };
+      poll();
+    } catch (e) { setError(String(e)); setBusy(""); }
+  }
+
+  async function suggestCharPrompt() {
+    if (!full) return;
+    setBusy("char-suggest");
+    try {
+      const ctx = `Ad: ${full.production.title}. Style: ${full.production.style || "n/a"}. Shots: ${full.shots.map(s => s.description || s.image_prompt).filter(Boolean).slice(0, 8).join(" | ")}. Write the recurring on-camera character/presenter for this ad.`;
+      const data = await post("/api/ad/suggest-prompt", { kind: "character", context: ctx, contentStyle: full.production.content_style });
+      if (data.prompt) setCharPrompt(data.prompt);
+    } catch (e) { setError(String(e)); }
+    finally { setBusy(""); }
+  }
+
+  async function clearCharacter() {
+    if (projectId == null) return;
+    setBusy("char-clear");
+    try {
+      await fetch("/api/projects/remove-character", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId }),
+      });
+      loadCharRef();
+    } catch (e) { setError(String(e)); }
     finally { setBusy(""); }
   }
 
@@ -310,15 +485,33 @@ export default function ProducePanel({ projectId, selectedId, onSelect }: Props)
     catch (e) { setError(String(e)); }
   }
 
+  async function saveShotEdit(shotId: number, fields: { description?: string; image_prompt?: string; video_prompt?: string }) {
+    if (!full) return;
+    try { await post(`/api/productions/${full.production.id}/shot-edit`, { shotId, ...fields }); await loadFull(); }
+    catch (e) { setError(String(e)); }
+  }
+
   async function saveStyle(style: string) {
     if (!full) return;
     try { await post(`/api/productions/${full.production.id}/style`, { style }); await loadFull(); }
     catch (e) { setError(String(e)); }
   }
 
+  async function saveAspect(aspectRatio: string) {
+    if (!full) return;
+    try { await post(`/api/productions/${full.production.id}/platform`, { aspectRatio }); await loadFull(); }
+    catch (e) { setError(String(e)); }
+  }
+
   async function setShotRefs(shotId: number, fields: { useCharacter?: boolean; useHero?: boolean; bgAssetId?: number | null }) {
     if (!full) return;
     try { await post(`/api/productions/${full.production.id}/shot-refs`, { shotId, ...fields }); await loadFull(); }
+    catch (e) { setError(String(e)); }
+  }
+
+  async function deleteShot(shotId: number) {
+    if (!full) return;
+    try { await post(`/api/productions/${full.production.id}/shots/${shotId}/delete`); setDeleteConfirmId(null); await loadFull(); }
     catch (e) { setError(String(e)); }
   }
 
@@ -387,6 +580,17 @@ export default function ProducePanel({ projectId, selectedId, onSelect }: Props)
     finally { setBusy(""); }
   }
 
+  async function saveAsTemplate() {
+    if (!full || !templateName.trim()) return;
+    setBusy("template");
+    try {
+      await post(`/api/productions/${full.production.id}/save-as-template`, { name: templateName.trim() });
+      setTemplateNameOpen(false); setTemplateName("");
+      setError(`Saved as template "${templateName.trim()}" — find it on the Templates page.`);
+    } catch (e) { setError(String(e)); }
+    finally { setBusy(""); }
+  }
+
   async function auditProduction() {
     if (!full) return;
     setBusy("audit"); setError(""); setAuditResults(null);
@@ -436,23 +640,35 @@ export default function ProducePanel({ projectId, selectedId, onSelect }: Props)
         <div className="flex-1 overflow-y-auto p-4 space-y-2">
           {list.length === 0 && (
             <p className="text-sm text-gray-500 text-center mt-12">
-              No productions yet. Build a shot list in Script Writer, then “Produce this script”.
+              No productions yet. Go to the Ad Pack tab to generate a test pack — each angle becomes a production here.
             </p>
           )}
           {list.map(p => (
-            <button key={p.id} onClick={() => onSelect(p.id)}
-              className="w-full flex items-center gap-3 border border-gray-200 rounded-xl px-3 py-2.5 hover:bg-gray-50 transition-colors text-left">
-              <div className="flex-1 min-w-0">
-                <p className="text-sm text-gray-800 truncate">{p.title}</p>
+            <div key={p.id}
+              className="w-full flex items-center gap-3 border border-gray-200 rounded-xl px-3 py-2.5 hover:bg-gray-50 transition-colors">
+              <button onClick={() => onSelect(p.id)} className="flex-1 min-w-0 text-left">
+                {renamingId === p.id ? (
+                  <input autoFocus value={renameValue} onChange={e => setRenameValue(e.target.value)}
+                    onClick={e => e.stopPropagation()}
+                    onKeyDown={e => { if (e.key === "Enter") renameProduction(p.id, renameValue); if (e.key === "Escape") setRenamingId(null); }}
+                    onBlur={() => renameProduction(p.id, renameValue)}
+                    className="w-full bg-white border border-gray-300 rounded px-1.5 py-0.5 text-sm text-black focus:outline-none" />
+                ) : (
+                  <p className="text-sm text-gray-800 truncate">{p.title}</p>
+                )}
                 <p className="text-[10px] text-gray-500">{new Date(p.created_at).toLocaleString()}</p>
-              </div>
-              <span className={`px-2 py-0.5 rounded text-[10px] font-medium ${
+              </button>
+              <button onClick={e => { e.stopPropagation(); setRenamingId(p.id); setRenameValue(p.title); }}
+                title="Rename" className="text-[10px] text-gray-300 hover:text-gray-700 flex-shrink-0 transition-colors">
+                ✎
+              </button>
+              <span className={`px-2 py-0.5 rounded text-[10px] font-medium flex-shrink-0 ${
                 p.status === "done" ? "bg-green-100 text-green-600" :
                 p.status === "failed" ? "bg-red-100 text-red-500" :
                 ACTIVE_STATUSES.includes(p.status) ? "bg-amber-100 text-amber-600" :
                 "bg-gray-100 text-gray-500"
               }`}>{p.status}</span>
-            </button>
+            </div>
           ))}
         </div>
       </div>
@@ -473,12 +689,26 @@ export default function ProducePanel({ projectId, selectedId, onSelect }: Props)
   const libCharacters = library.filter(a => a.kind === "character");
   const libBackgrounds = library.filter(a => a.kind === "background");
   const hasCharacter = Boolean(charRef?.image);
-  // How many references a shot sends to kie (keep ≤2 to avoid dilution).
+  // Whether THIS script's shots actually feature a product / a person — drives the
+  // "needed for this script" guidance so the user isn't asked to set up references
+  // that don't apply (e.g. a pure product close-up needs no character, and vice versa).
+  const heroNeeded = shots.some(s => s.label_visible);
+  const characterNeeded = shots.some(s => s.use_character);
+  const hasHero = Boolean(production.hero_ref_url || production.product_image_filename);
+  // How many references a shot actually sends to kie (keep ≤2 to avoid dilution).
+  // Counts every source the server adds in keyframeReferenceUrls — including the scene
+  // continuity chain and the production-wide style-ref image — so the badge can't lie.
   function refCount(s: ProductionShot): number {
-    return (s.label_visible && (production.hero_ref_url || production.product_image_filename) ? 1 : 0)
-      + (s.use_character && hasCharacter ? 1 : 0)
-      + (s.bg_asset_id ? 1 : 0)
-      + (s.ref_shot ? 1 : 0);
+    const hero = s.label_visible && (production.hero_ref_url || production.product_image_filename) ? 1 : 0;
+    const character = s.use_character && hasCharacter ? 1 : 0;
+    const background = s.bg_asset_id ? 1 : 0;
+    // Scene continuity: an earlier same-scene shot (last-frame chain / anchor) or a manual carry — one ref.
+    // ref_shot === 0 is an explicit "no continuity" override — always 0 refs, regardless of scene_id.
+    const continuity = s.ref_shot === 0 ? 0
+      : (s.scene_id && shots.some(o => o.scene_id === s.scene_id && o.shot_number < s.shot_number)) || s.ref_shot ? 1 : 0;
+    // The style-ref image is fed into every shot.
+    const styleRef = production.style_ref_url ? 1 : 0;
+    return hero + character + background + continuity + styleRef;
   }
 
   async function confirmSave() {
@@ -491,74 +721,115 @@ export default function ProducePanel({ projectId, selectedId, onSelect }: Props)
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
       {/* Header */}
-      <div className="px-4 py-3 border-b border-gray-200 flex items-center justify-between flex-shrink-0">
-        <div className="flex items-center gap-3 min-w-0">
+      <div className="border-b border-gray-200 flex-shrink-0">
+        {/* Identity row */}
+        <div className="px-4 pt-3 pb-2 flex items-center gap-3 min-w-0">
           <button onClick={() => { onSelect(null); loadList(); }}
             className="text-xs text-gray-500 hover:text-gray-800 transition-colors flex-shrink-0">← All</button>
           <div className="min-w-0">
             <p className="text-sm font-medium text-gray-900 truncate">{production.title}</p>
             <p className="text-[10px] text-gray-500">
               {production.status} · {shots.length} shots · ≈{totalSecs}s final · {kfDone}/{shots.length} keyframes · {done}/{shots.length} clips{failed ? ` · ${failed} failed` : ""}{productMode ? " · product mode" : ""}
+              {production.credits_spent > 0 && (
+                <span title="kie credits spent generating this production so far">
+                  {" · "}${(production.credits_spent * USD_PER_CREDIT).toFixed(2)} spent
+                </span>
+              )}
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-2 flex-shrink-0">
-          <label className="flex items-center gap-1 text-[10px] text-gray-500">
-            <input type="checkbox" checked={dryRun} onChange={e => setDryRun(e.target.checked)} disabled={active} />
-            Dry run
-          </label>
+
+        {/* Settings row */}
+        <div className="px-4 pb-2 flex items-center gap-2 flex-wrap">
+          <select value={production.aspect_ratio || "16:9"} onChange={e => saveAspect(e.target.value)} disabled={active}
+            title="Aspect ratio — 9:16 for TikTok/Reels, 16:9 for YouTube. Applies to keyframes + video."
+            className="bg-white border border-gray-300 text-black rounded-lg px-2 py-1 text-[11px]">
+            <option value="9:16">9:16 vertical</option>
+            <option value="16:9">16:9 landscape</option>
+          </select>
           <select value={imageModel} onChange={e => setImageModel(e.target.value)} disabled={active}
             title="Keyframe model — Nano Banana 2 holds the hero/character reference far better"
             className="bg-white border border-gray-300 text-black rounded-lg px-2 py-1 text-[11px]">
             <option value="nano-banana-2">Nano Banana 2 (consistent)</option>
             <option value="google/nano-banana">Nano Banana v1 (cheap draft)</option>
           </select>
-          <select value={quality} onChange={e => setQuality(e.target.value)} disabled={active}
+          <select value={engine} onChange={e => setEngine(e.target.value as EngineChoice)} disabled={active}
+            title="Which model actually renders the clip — priced roughly cheapest to priciest per ~8s clip"
             className="bg-white border border-gray-300 text-black rounded-lg px-2 py-1 text-[11px]">
-            <option value="fast">Veo Fast</option>
-            <option value="quality">Veo Quality</option>
+            <option value="veo-lite">Veo Lite (~$0.15)</option>
+            <option value="veo-fast">Veo Fast (~$0.30)</option>
+            <option value="seedance">Seedance 1.5 Pro (~$0.14–0.30)</option>
+            <option value="kling">Kling 3.0 (~$0.56–0.72)</option>
+            <option value="veo-quality">Veo Quality (~$2.00)</option>
           </select>
-          {active
-            ? <button onClick={stop} disabled={busy === "stop"}
-                className="px-3 py-1.5 bg-red-500 text-white text-xs font-semibold rounded-lg hover:bg-red-400 disabled:opacity-40 transition-colors">
-                {busy === "stop" ? "Stopping…" : "Stop"}
+        </div>
+
+        {/* Actions row */}
+        <div className="px-4 pb-3 flex items-center justify-between gap-2 flex-wrap">
+          <div className="flex items-center gap-2 flex-wrap">
+            {active
+              ? <button onClick={stop} disabled={busy === "stop"}
+                  className="px-3 py-1.5 bg-red-500 text-white text-xs font-semibold rounded-lg hover:bg-red-400 disabled:opacity-40 transition-colors">
+                  {busy === "stop" ? "Stopping…" : "Stop"}
+                </button>
+              : <>
+                  <button onClick={() => produce("keyframes")} disabled={busy !== "" || !needKeyframes}
+                    title="Generate all keyframes only — review them before spending on video"
+                    className="px-3 py-1.5 bg-gray-900 text-white text-xs font-semibold rounded-lg hover:bg-gray-700 disabled:opacity-40 transition-colors">
+                    {busy === "keyframes" ? "Starting…" : "1 · Keyframes"}
+                  </button>
+                  <button onClick={() => produce("videos")} disabled={busy !== "" || !readyForVideo}
+                    title="Animate the approved keyframes into clips"
+                    className="px-3 py-1.5 bg-gray-900 text-white text-xs font-semibold rounded-lg hover:bg-gray-700 disabled:opacity-40 transition-colors">
+                    {busy === "videos" ? "Starting…" : "2 · Videos"}
+                  </button>
+                </>
+            }
+            <button onClick={assemble} disabled={busy === "assemble" || active || done === 0}
+              className="px-3 py-1.5 border border-gray-300 text-gray-700 text-xs font-semibold rounded-lg hover:bg-gray-50 disabled:opacity-40 transition-colors">
+              {busy === "assemble" ? "Assembling…" : "Assemble"}
+            </button>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            {kfDone > 0 && (
+              <button onClick={auditProduction} disabled={busy !== "" || active}
+                title="Send all keyframes to Claude Vision for a cross-shot consistency check"
+                className="px-3 py-1.5 border border-purple-200 text-purple-600 text-xs font-semibold rounded-lg hover:bg-purple-50 disabled:opacity-40 transition-colors">
+                {busy === "audit" ? "Auditing…" : "Audit keyframes"}
               </button>
-            : <>
-                <button onClick={() => produce("keyframes")} disabled={busy !== "" || !needKeyframes}
-                  title="Generate all keyframes only — review them before spending on video"
-                  className="px-3 py-1.5 bg-gray-900 text-white text-xs font-semibold rounded-lg hover:bg-gray-700 disabled:opacity-40 transition-colors">
-                  {busy === "keyframes" ? "Starting…" : "1 · Keyframes"}
-                </button>
-                <button onClick={() => produce("videos")} disabled={busy !== "" || !readyForVideo}
-                  title="Animate the approved keyframes into clips"
-                  className="px-3 py-1.5 bg-gray-900 text-white text-xs font-semibold rounded-lg hover:bg-gray-700 disabled:opacity-40 transition-colors">
-                  {busy === "videos" ? "Starting…" : "2 · Videos"}
-                </button>
-              </>
-          }
-          <button onClick={assemble} disabled={busy === "assemble" || active || done === 0}
-            className="px-3 py-1.5 border border-gray-300 text-gray-700 text-xs font-semibold rounded-lg hover:bg-gray-50 disabled:opacity-40 transition-colors">
-            {busy === "assemble" ? "Assembling…" : "Assemble"}
-          </button>
-          <button onClick={duplicate} disabled={busy === "duplicate" || active}
-            title="Clone this shot list into a fresh production with all shots reset — e.g. to do a real run after a dry-run rehearsal"
-            className="px-3 py-1.5 border border-gray-300 text-gray-700 text-xs font-semibold rounded-lg hover:bg-gray-50 disabled:opacity-40 transition-colors">
-            {busy === "duplicate" ? "Copying…" : "Duplicate"}
-          </button>
-          {kfDone > 0 && (
-            <button onClick={auditProduction} disabled={busy !== "" || active}
-              title="Send all keyframes to Claude Vision for a cross-shot consistency check"
-              className="px-3 py-1.5 border border-purple-200 text-purple-600 text-xs font-semibold rounded-lg hover:bg-purple-50 disabled:opacity-40 transition-colors">
-              {busy === "audit" ? "Auditing…" : "Audit keyframes"}
+            )}
+            {shots.length > 0 && !active && (
+              <button onClick={engineerPrompts} disabled={busy !== ""}
+                title="Re-engineer all pending shot prompts in one batch call for coherent wording across shots"
+                className="px-3 py-1.5 border border-blue-200 text-blue-600 text-xs font-semibold rounded-lg hover:bg-blue-50 disabled:opacity-40 transition-colors">
+                {busy === "engineer" ? "Engineering…" : "Batch engineer"}
+              </button>
+            )}
+            <button onClick={duplicate} disabled={busy === "duplicate" || active}
+              title="Clone this shot list into a fresh production with all shots reset"
+              className="px-3 py-1.5 border border-gray-300 text-gray-700 text-xs font-semibold rounded-lg hover:bg-gray-50 disabled:opacity-40 transition-colors">
+              {busy === "duplicate" ? "Copying…" : "Duplicate"}
             </button>
-          )}
-          {shots.length > 0 && !active && (
-            <button onClick={engineerPrompts} disabled={busy !== ""}
-              title="Re-engineer all pending shot prompts in one batch call for coherent wording across shots"
-              className="px-3 py-1.5 border border-blue-200 text-blue-600 text-xs font-semibold rounded-lg hover:bg-blue-50 disabled:opacity-40 transition-colors">
-              {busy === "engineer" ? "Engineering…" : "Batch engineer"}
-            </button>
-          )}
+            {shots.length > 0 && (
+              templateNameOpen ? (
+                <span className="flex items-center gap-1">
+                  <input value={templateName} onChange={e => setTemplateName(e.target.value)} autoFocus
+                    onKeyDown={e => { if (e.key === "Enter") saveAsTemplate(); if (e.key === "Escape") setTemplateNameOpen(false); }}
+                    placeholder="Template name…"
+                    className="w-40 bg-white border border-gray-300 rounded-lg px-2 py-1 text-xs text-black placeholder-gray-400 focus:outline-none" />
+                  <button onClick={saveAsTemplate} disabled={busy === "template" || !templateName.trim()}
+                    className="px-2 py-1.5 bg-gray-900 text-white text-xs font-semibold rounded-lg disabled:opacity-40">Save</button>
+                  <button onClick={() => setTemplateNameOpen(false)} className="px-1 text-xs text-gray-500 hover:text-gray-800">Cancel</button>
+                </span>
+              ) : (
+                <button onClick={() => { setTemplateNameOpen(true); setTemplateName(production.title); }} disabled={active}
+                  title="Save this shot structure (camera direction, pacing, prompts) as a reusable template for future products"
+                  className="px-3 py-1.5 border border-gray-300 text-gray-700 text-xs font-semibold rounded-lg hover:bg-gray-50 disabled:opacity-40 transition-colors">
+                  💾 Save as template
+                </button>
+              )
+            )}
+          </div>
         </div>
       </div>
 
@@ -588,6 +859,24 @@ export default function ProducePanel({ projectId, selectedId, onSelect }: Props)
           <div className="flex items-center justify-between">
             <p className="text-[10px] uppercase tracking-widest text-gray-500">Consistency references</p>
             <span className="text-[10px] text-gray-400">fed into every keyframe</span>
+          </div>
+
+          {/* What THIS script actually needs — not every ad needs every reference */}
+          <div className="flex gap-2 flex-wrap">
+            <span className={`text-[10px] px-2 py-0.5 rounded-full border ${
+              !heroNeeded ? "bg-gray-50 text-gray-400 border-gray-200"
+              : hasHero ? "bg-green-50 text-green-600 border-green-200"
+              : "bg-amber-50 text-amber-600 border-amber-200"
+            }`}>
+              {!heroNeeded ? "Hero product — not needed for this script" : hasHero ? "✓ Hero product set" : "⚠ Hero product needed — no shots reference one yet"}
+            </span>
+            <span className={`text-[10px] px-2 py-0.5 rounded-full border ${
+              !characterNeeded ? "bg-gray-50 text-gray-400 border-gray-200"
+              : hasCharacter ? "bg-green-50 text-green-600 border-green-200"
+              : "bg-amber-50 text-amber-600 border-amber-200"
+            }`}>
+              {!characterNeeded ? "Character — not needed for this script" : hasCharacter ? "✓ Character set" : "⚠ Character needed — no character set yet"}
+            </span>
           </div>
 
           {/* Global rendering style */}
@@ -664,32 +953,98 @@ export default function ProducePanel({ projectId, selectedId, onSelect }: Props)
                   {libProducts.map(a => <option key={a.id} value={a.id}>{a.name}</option>)}
                 </select>
               )}
+
+              {/* Real product photos → production-ready hero (up to 3 angles: front/side/label close-up) */}
+              <div className="border border-gray-200 rounded-lg p-2 space-y-1.5 bg-gray-50">
+                <p className="text-[10px] text-gray-500">Have real product photos? Upload up to 3 angles (front, side, label close-up) and Nano Banana will clean them up into a studio-ready hero shot — more angles give it real 3D/label information instead of guessing.</p>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <button onClick={() => heroPhotoInputRef.current?.click()} disabled={active || busy === "hero-photos" || heroPhotoFiles.length >= 3}
+                    className="text-[11px] border border-gray-300 text-gray-600 rounded-lg px-2 py-1 hover:bg-white disabled:opacity-40 transition-colors">
+                    + Add photo ({heroPhotoFiles.length}/3)
+                  </button>
+                  <input ref={heroPhotoInputRef} type="file" accept="image/*" className="hidden"
+                    onChange={e => { const f = e.target.files?.[0]; if (f) setHeroPhotoFiles(prev => [...prev, f].slice(0, 3)); e.target.value = ""; }} />
+                  {heroPhotoFiles.map((f, i) => (
+                    <span key={i} className="flex items-center gap-1 text-[10px] bg-white border border-gray-200 rounded px-1.5 py-0.5 text-gray-600">
+                      {f.name.length > 16 ? f.name.slice(0, 14) + "…" : f.name}
+                      <button onClick={() => setHeroPhotoFiles(prev => prev.filter((_, j) => j !== i))} className="text-gray-400 hover:text-red-500">✕</button>
+                    </span>
+                  ))}
+                </div>
+                {heroPhotoFiles.length > 0 && (
+                  <>
+                    <input value={heroPhotoNotes} onChange={e => setHeroPhotoNotes(e.target.value)}
+                      placeholder="Optional extra direction — e.g. angled 3/4 view, on a wooden surface…"
+                      className="w-full bg-white border border-gray-300 rounded px-2 py-1 text-[11px] text-black placeholder-gray-400 focus:outline-none" />
+                    <button onClick={generateHeroFromPhotos} disabled={active || busy === "hero-photos"}
+                      className="text-[11px] bg-gray-900 text-white font-semibold rounded-lg px-3 py-1 hover:bg-gray-700 disabled:opacity-40 transition-colors">
+                      {busy === "hero-photos" ? "Generating…" : "Generate hero from photos"}
+                    </button>
+                  </>
+                )}
+              </div>
+              <p className="text-[10px] text-gray-400 text-center">— or write a prompt from scratch —</p>
+
               <textarea value={heroPrompt} onChange={e => setHeroPrompt(e.target.value)}
-                placeholder="Hero still prompt — e.g. matte-black VOLT can, yuzu-citrus, studio lighting, condensation, front label sharp and centred"
+                placeholder="Hero still prompt — e.g. matte-black VOLT can, yuzu-citrus, studio lighting, condensation, front label sharp and centred. Tip: keep the logo a short bold wordmark — fine print and detailed logos garble on regeneration."
                 rows={2}
                 className="w-full bg-white border border-gray-300 rounded-lg px-2 py-1.5 text-[11px] text-black placeholder-gray-400 resize-none focus:outline-none focus:border-gray-500" />
-              <button onClick={generateHero} disabled={active || busy === "hero" || (!dryRun && !heroPrompt.trim())}
-                className="text-[11px] bg-gray-900 text-white font-semibold rounded-lg px-3 py-1 hover:bg-gray-700 disabled:opacity-40 transition-colors">
-                {busy === "hero" ? "Generating…" : production.hero_ref_filename ? "Regenerate hero" : "Generate hero still"}
-              </button>
+              <div className="flex items-center gap-2">
+                <button onClick={suggestHeroPrompt} disabled={active || busy === "suggest"}
+                  title="Draft a hero prompt from this ad's shots + style"
+                  className="text-[11px] border border-gray-300 text-gray-600 rounded-lg px-2 py-1 hover:bg-gray-50 disabled:opacity-40 transition-colors">
+                  {busy === "suggest" ? "…" : "✨ Suggest"}
+                </button>
+                <button onClick={generateHero} disabled={active || busy === "hero" || !heroPrompt.trim()}
+                  className="text-[11px] bg-gray-900 text-white font-semibold rounded-lg px-3 py-1 hover:bg-gray-700 disabled:opacity-40 transition-colors">
+                  {busy === "hero" ? "Generating…" : production.hero_ref_filename ? "Regenerate hero" : "Generate hero still"}
+                </button>
+              </div>
             </div>
           </div>
 
           {/* Character reference status */}
           <div className="pt-1 border-t border-gray-100 space-y-1.5">
-            <div className="flex items-center gap-2">
+            <div className="flex gap-3">
               {charRef?.image ? (
-                <>
-                  <img src={`/api/media/${charRef.image}`} alt="" className="w-6 h-6 rounded-full object-cover border border-gray-200" />
-                  <p className="text-[11px] text-green-600 flex-1">✓ Character reference active — the person stays consistent across shots.</p>
-                  <button onClick={() => { setSaveKind("character"); setSaveName(charRef?.name || "Character"); }} disabled={!charRef?.url}
-                    className="text-[11px] text-blue-500 hover:text-blue-400 disabled:opacity-40 flex-shrink-0" title="Reuse this character across other ads">★ Save to library</button>
-                </>
+                <img src={`/api/media/${charRef.image}`} alt="" className="w-16 h-16 rounded-lg object-cover border border-gray-200 flex-shrink-0" />
               ) : (
-                <p className="text-[11px] text-gray-400">
-                  No character set — the on-camera person won't be locked. Pick one from your library below, or add one in Script Writer → Character.
-                </p>
+                <div className="w-16 h-16 rounded-lg border border-dashed border-gray-200 flex items-center justify-center text-[9px] text-gray-400 flex-shrink-0 text-center px-1">
+                  no character
+                </div>
               )}
+              <div className="flex-1 min-w-0 space-y-1.5">
+                {charRef?.image ? (
+                  <>
+                    <p className="text-[11px] text-green-600">✓ Character active — the person stays consistent across shots.</p>
+                    <div className="flex gap-3 flex-wrap">
+                      <button onClick={clearCharacter} disabled={active || busy.startsWith("char")}
+                        className="text-[11px] text-gray-500 hover:text-gray-800 disabled:opacity-40">Clear</button>
+                      <button onClick={() => { setSaveKind("character"); setSaveName(charRef?.name || "Character"); }} disabled={!charRef?.url}
+                        className="text-[11px] text-blue-500 hover:text-blue-400 disabled:opacity-40" title="Reuse this character across other ads">★ Save to library</button>
+                    </div>
+                  </>
+                ) : (
+                  <p className="text-[11px] text-gray-500">Generate a character, or reuse one from your library — it anchors the on-camera person across every shot.</p>
+                )}
+                <textarea value={charPrompt} onChange={e => setCharPrompt(e.target.value)}
+                  placeholder={production.content_style === "ugc"
+                    ? "Character prompt — e.g. full-body reference of a man in his 30s, bed-head, grey t-shirt, neutral pose, plain studio background"
+                    : "Character prompt — Tip: for Polished ads, describe a TURNAROUND SHEET (same person, front + 3/4 + profile poses side by side) so varied camera angles stay consistent, e.g. a man in his 30s, bed-head, grey t-shirt, shown front-facing / 3/4 / side profile, plain studio background"}
+                  rows={2}
+                  className="w-full bg-white border border-gray-300 rounded-lg px-2 py-1.5 text-[11px] text-black placeholder-gray-400 resize-none focus:outline-none focus:border-gray-500" />
+                <div className="flex items-center gap-2">
+                  <button onClick={suggestCharPrompt} disabled={active || busy === "char-suggest"}
+                    title="Draft a character prompt from this ad's shots + style"
+                    className="text-[11px] border border-gray-300 text-gray-600 rounded-lg px-2 py-1 hover:bg-gray-50 disabled:opacity-40 transition-colors">
+                    {busy === "char-suggest" ? "…" : "✨ Suggest"}
+                  </button>
+                  <button onClick={generateCharacter} disabled={active || busy === "char" || !charPrompt.trim() || projectId == null}
+                    className="text-[11px] bg-gray-900 text-white font-semibold rounded-lg px-3 py-1 hover:bg-gray-700 disabled:opacity-40 transition-colors">
+                    {busy === "char" ? "Generating…" : charRef?.image ? "Regenerate character" : "Generate character"}
+                  </button>
+                </div>
+              </div>
             </div>
             {libCharacters.length > 0 && (
               <select value="" onChange={e => { if (e.target.value) applyLibraryCharacter(Number(e.target.value)); }}
@@ -791,10 +1146,12 @@ export default function ProducePanel({ projectId, selectedId, onSelect }: Props)
 
         {/* Shot table */}
         <div className="space-y-2">
+          <InsertShotSlot productionId={production.id} afterShotNumber={0} disabled={active} onDone={loadFull} />
           {shots.map(shot => {
             const st = STATUS_STYLE[shot.status];
             return (
-              <div key={shot.id} className="border border-gray-200 rounded-xl p-3">
+              <div key={shot.id}>
+              <div className="border border-gray-200 rounded-xl p-3">
                 <div className="flex items-start gap-3">
                   <span className="text-xs font-bold text-gray-500 w-5 flex-shrink-0 mt-0.5">{shot.shot_number}</span>
 
@@ -826,8 +1183,42 @@ export default function ProducePanel({ projectId, selectedId, onSelect }: Props)
                           {shot.scene_id}
                         </span>
                       )}
-                      <p className="text-xs text-gray-600 truncate">{shot.description || shot.image_prompt}</p>
+                      <p className="text-xs text-gray-600 truncate flex-1">{shot.description || shot.image_prompt}</p>
+                      <button onClick={() => setEditingShot(editingShot === shot.id ? null : shot.id)} disabled={active}
+                        className="text-[10px] text-gray-400 hover:text-gray-700 flex-shrink-0 disabled:opacity-40">
+                        {editingShot === shot.id ? "close" : "✎ edit"}
+                      </button>
+                      {deleteConfirmId === shot.id ? (
+                        <span className="flex items-center gap-1 flex-shrink-0">
+                          <button onClick={() => deleteShot(shot.id)}
+                            className="text-[10px] text-white bg-red-500 hover:bg-red-400 rounded px-1.5 py-0.5 transition-colors">
+                            Delete?
+                          </button>
+                          <button onClick={() => setDeleteConfirmId(null)} className="text-[10px] text-gray-400 hover:text-gray-700">
+                            cancel
+                          </button>
+                        </span>
+                      ) : (
+                        <button onClick={() => setDeleteConfirmId(shot.id)} disabled={active}
+                          title="Remove this shot"
+                          className="text-[10px] text-gray-300 hover:text-red-500 flex-shrink-0 disabled:opacity-40">
+                          ✕
+                        </button>
+                      )}
                     </div>
+                    {editingShot === shot.id && (
+                      <div className="mb-1.5 space-y-1.5 p-2 bg-gray-50 rounded-lg border border-gray-200">
+                        {(["description", "image_prompt", "video_prompt"] as const).map(fld => (
+                          <div key={fld}>
+                            <label className="text-[9px] uppercase tracking-widest text-gray-400 block">{fld.replace("_", " ")}</label>
+                            <textarea key={`${shot.id}-${fld}`} defaultValue={shot[fld] ?? ""} disabled={active} rows={fld === "description" ? 2 : 3}
+                              onBlur={e => { if (e.target.value !== (shot[fld] ?? "")) saveShotEdit(shot.id, { [fld]: e.target.value } as { description?: string }); }}
+                              className="w-full bg-white border border-gray-300 rounded px-2 py-1 text-[11px] text-black resize-none focus:outline-none focus:border-gray-500" />
+                          </div>
+                        ))}
+                        <p className="text-[9px] text-gray-400">Saves on blur. Then Retry this shot's keyframe to apply the change.</p>
+                      </div>
+                    )}
                     <p className="text-[10px] text-gray-400 mt-0.5 flex items-center gap-1 flex-wrap">
                       <span>{shot.camera_shot || "—"}</span>
                       <span>·</span>
@@ -845,10 +1236,15 @@ export default function ProducePanel({ projectId, selectedId, onSelect }: Props)
                       </button>
                       {shot.shot_number > 1 && (
                         <select value={shot.ref_shot ?? ""} disabled={active}
-                          onChange={e => saveRefShot(shot.id, e.target.value ? Number(e.target.value) : null)}
-                          title="Carry an earlier shot's scene/props into this keyframe for continuity"
-                          className={`rounded text-[9px] px-0.5 py-0.5 border ${shot.ref_shot ? "bg-purple-50 border-purple-200 text-purple-600" : "bg-transparent border-gray-200 text-gray-400"}`}>
-                          <option value="">carry scene…</option>
+                          onChange={e => saveRefShot(shot.id, e.target.value === "" ? null : Number(e.target.value))}
+                          title="Scene continuity — Auto lets the pipeline link same-location shots automatically; None explicitly turns that off for this shot even if it shares a scene; or pick a specific earlier shot to carry from"
+                          className={`rounded text-[9px] px-0.5 py-0.5 border ${
+                            shot.ref_shot === 0 ? "bg-gray-100 border-gray-300 text-gray-500"
+                            : shot.ref_shot ? "bg-purple-50 border-purple-200 text-purple-600"
+                            : "bg-transparent border-gray-200 text-gray-400"
+                          }`}>
+                          <option value="">Auto (scene continuity)</option>
+                          <option value="0">None — no reference</option>
                           {shots.filter(s => s.shot_number < shot.shot_number).map(s => (
                             <option key={s.id} value={s.shot_number}>↩ from shot {s.shot_number}</option>
                           ))}
@@ -898,11 +1294,13 @@ export default function ProducePanel({ projectId, selectedId, onSelect }: Props)
                     {shot.audit_notes && (
                       <p className="text-[10px] text-purple-600 mt-0.5 leading-snug">⚠ Audit: {shot.audit_notes}</p>
                     )}
-                    <RetryShot productionId={production.id} shot={shot} dryRun={dryRun} quality={quality} imageModel={imageModel} disabled={active} onDone={loadFull} />
+                    <RetryShot productionId={production.id} shot={shot} engine={engine} imageModel={imageModel} disabled={active} onDone={loadFull} />
                   </div>
 
                   <span className={`px-2 py-0.5 rounded text-[10px] font-medium flex-shrink-0 ${st.cls}`}>{st.label}</span>
                 </div>
+              </div>
+              <InsertShotSlot productionId={production.id} afterShotNumber={shot.shot_number} disabled={active} onDone={loadFull} />
               </div>
             );
           })}
